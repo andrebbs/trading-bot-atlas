@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+.venv*/
+*.venv/
+
+# Credenciais e configurações sensíveis
+.env
+*.key
+*.pem
+
+# Logs
+*.log
+trading_bot.log
+
+# Relatórios e outputs
+backtest_report.json
+backtest_results.png
+*.csv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/

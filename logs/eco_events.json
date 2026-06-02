@@ -1,0 +1,50 @@
+{
+  "events": [
+    {
+      "event": "Employment Change",
+      "country": "US",
+      "importance": "high",
+      "date": "2026-05-19",
+      "time": "14:30",
+      "forecast": "250K",
+      "previous": "272K"
+    },
+    {
+      "event": "Core CPI MoM",
+      "country": "US",
+      "importance": "high",
+      "date": "2026-05-20",
+      "time": "12:30",
+      "forecast": "0.3%",
+      "previous": "0.4%"
+    },
+    {
+      "event": "Inflation Rate YoY",
+      "country": "EU",
+      "importance": "high",
+      "date": "2026-05-21",
+      "time": "09:00",
+      "forecast": "2.1%",
+      "previous": "2.4%"
+    },
+    {
+      "event": "Interest Rate Decision",
+      "country": "JP",
+      "importance": "high",
+      "date": "2026-05-22",
+      "time": "05:00",
+      "forecast": "0.1%",
+      "previous": "0.1%"
+    },
+    {
+      "event": "Retail Sales MoM",
+      "country": "GB",
+      "importance": "medium",
+      "date": "2026-05-23",
+      "time": "08:00",
+      "forecast": "0.5%",
+      "previous": "-1.0%"
+    }
+  ],
+  "updated": "2026-05-19T13:26:33.763522"
+}

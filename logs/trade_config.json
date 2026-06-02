@@ -1,0 +1,13 @@
+{
+  "config": {
+    "max_trades_per_day": 5,
+    "risk_pct": 1.0,
+    "leverage": 5,
+    "daily_loss_limit_pct": 3.0,
+    "require_market_good": false
+  },
+  "today": "2026-06-01",
+  "trades_count": 0,
+  "daily_pnl": 0.0,
+  "updated": "2026-06-01T22:24:02.036586"
+}

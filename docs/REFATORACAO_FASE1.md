@@ -66,43 +66,56 @@
 
 **Total Extraído: ~829 linhas em 4 módulos | 3 commits**
 
-### 🎯 Etapa 3: Criar Services de Domínio
+### 🎯 Etapa 3: Criar Services de Domínio ✅
 
-#### 3.1 - signal_evaluator.py (~400 linhas)
-- [ ] `evaluate_signal_setup(df, signal, signal_data, timeframe) -> dict`
-- [ ] `_signal_quality_consensus(signal_data: dict, signal: int) -> int`
-- [ ] `_three_candle_confirmation(df, signal) -> tuple`
-- [ ] `_detect_sweep(df, signal, lookback) -> tuple`
-- [ ] `is_false_breakout_risk(df, signal, timeframe) -> bool`
-- [ ] `_last_fractal_level(df, direction)`
+#### 3.1 - signal_evaluator.py (588 linhas) ✅
+- [x] `evaluate_signal_setup(df, signal, signal_data, timeframe) -> dict`
+- [x] `signal_quality_consensus(signal_data: dict, signal: int) -> int`
+- [x] `_three_candle_confirmation(df, signal) -> tuple`
+- [x] `_detect_sweep(df, signal, lookback) -> tuple`
+- [x] `is_false_breakout_risk(df, signal, timeframe) -> bool`
+- [x] `_last_fractal_level(df, direction)`
+- [x] Commit: 7099567
 - [ ] Testes manuais: /analyze múltiplos ativos
 
-#### 3.2 - liquidity_checker.py (~150 linhas)
-- [ ] `_check_crypto_liquidity_session(asset: str) -> tuple[bool, str]`
-- [ ] `_is_forex_session_active() -> tuple`
-- [ ] `_get_crypto_signal_profile(asset: str) -> dict`
-- [ ] Constantes: CRYPTO_TIER1_SYMBOLS, TIER2, TIER3
+#### 3.2 - liquidity_checker.py (332 linhas) ✅
+- [x] `check_crypto_liquidity_session(asset: str) -> tuple[bool, str]`
+- [x] `is_forex_session_active() -> tuple`
+- [x] `get_crypto_signal_profile(asset: str) -> dict`
+- [x] `get_active_session_info() -> dict`
+- [x] Constantes: CRYPTO_TIER1/2/3_SYMBOLS, CRYPTO_ALIAS_MAP
+- [x] Commit: fc48d36
 - [ ] Testes manuais: /analyze ADA (tier 3 fora de horário)
 
-#### 3.3 - quality_gates.py (~100 linhas)
-- [ ] `get_quality_gates(timeframe: str) -> dict`
-- [ ] `get_setup_min_score(timeframe: str) -> int`
-- [ ] `get_symbols_per_cycle(total_symbols, actionable_tfs) -> int`
+#### 3.3 - quality_gates.py (257 linhas) ✅
+- [x] `get_quality_gates(timeframe: str, is_weekend_mode) -> tuple`
+- [x] `get_setup_min_score(timeframe: str, is_weekend_mode) -> int`
+- [x] `get_symbols_per_cycle(total_symbols, actionable_tfs) -> int`
+- [x] `validate_signal_quality(...) -> tuple`
+- [x] `get_quality_profile(timeframe, is_weekend_mode) -> dict`
+- [x] Commit: 2fbdf1b
 - [ ] Testes manuais: /monitor start (verificar gates)
 
-#### 3.4 - trend_analyzer.py (~80 linhas)
-- [ ] `get_primary_trend(exchange, symbol, timeframe) -> int`
-- [ ] `score_monitor_candidate(...) -> dict`
-- [ ] `classify_binary_entry(...) -> str`
+#### 3.4 - trend_analyzer.py (289 linhas) ✅
+- [x] `get_primary_trend(exchange, symbol, timeframe) -> int`
+- [x] `score_monitor_candidate(...) -> float`
+- [x] `classify_binary_entry(...) -> dict`
+- [x] `get_trend_alignment_bonus(primary_trend, signal) -> float`
+- [x] Commit: 71e52b7
 - [ ] Testes manuais: /analyze com trend analysis
 
-#### 3.5 - weekend_analyzer.py (~200 linhas)
-- [ ] `evaluate_weekend_binary_setup(...) -> tuple`
-- [ ] `_count_range_touches(values, level, tolerance) -> int`
-- [ ] `allow_weekend_reentry(...) -> bool`
-- [ ] `reset_weekend_reentry_state(symbol_key)`
-- [ ] `has_pending_martingale_decision(symbol_key, signal) -> bool`
+#### 3.5 - weekend_analyzer.py (556 linhas) ✅
+- [x] `evaluate_weekend_binary_setup(...) -> dict`
+- [x] `_count_range_touches(values, level, tolerance) -> int`
+- [x] `allow_weekend_reentry(...) -> bool`
+- [x] `update_weekend_reentry_state(symbol_key, signal, now)`
+- [x] `get_weekend_reentry_stats(symbol_key, signal) -> dict`
+- [x] `clear_weekend_reentry_tracker()`
+- [x] `is_weekend_binary_mode(reference_time, market_type) -> bool`
+- [x] Commit: ce2e820
 - [ ] Testes manuais: /analyze no fim de semana
+
+**Total Extraído: ~2,022 linhas em 5 módulos | 5 commits**
 
 ### 📱 Etapa 4: Separar Telegram Handlers
 

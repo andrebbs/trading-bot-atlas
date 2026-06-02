@@ -2088,9 +2088,26 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
                 parse_mode='Markdown',
             )
             return
+    
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FOREX REQUER MT5 OU TRADINGVIEW (não disponível via BitGet)
+    # ═══════════════════════════════════════════════════════════════════════════════
+    if av_type == 'forex':
+        await update.message.reply_text(
+            f"🌍 **{current_symbol}** - Análise Forex\n\n"
+            f"⚠️ **Dados forex via exchange não disponíveis**\n"
+            f"Pares forex não estão listados na BitGet (exchange de crypto).\n\n"
+            f"📊 **Opções para análise forex:**\n"
+            f"• Use `/monitor on` para monitorar via TradingView Scanner\n"
+            f"• Configure MT5 para análise detalhada (ver /help)\n"
+            f"• Registre sinais externos via `/pocket_add {current_symbol} BUY 5m`\n\n"
+            f"💡 O sistema ATLAS para forex requer fonte de dados MT5 ou TradingView Premium.",
+            parse_mode='Markdown'
+        )
+        return
 
     try:
-        # Instancia exchange connector
+        # Instancia exchange connector (apenas para crypto)
         exchange = ExchangeConnector(testnet=config.TESTNET)
         
         # Busca dados históricos do exchange

@@ -2042,50 +2042,32 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=None, timeframe=None):
-    """Análise avulsa usando engine TradingView (9 critérios profissionais)."""
-    import math as _math
-
+    """Análise avulsa usando sistema ATLAS (5 técnicas com confluência)."""
     current_symbol = (symbol or config.SYMBOL).upper()
     current_timeframe = _resolve_analysis_timeframe(timeframe)
     config.TIMEFRAME = current_timeframe
-    confirm_timeframe = get_higher_timeframe(current_timeframe)
 
-    # Normaliza para chave do TV_TICKER_MAP
-    # Ex: "BTC/USDT" → "BTC", "ETH/USDT" → "ETH", "US500" → "US500"
-    tv_key = current_symbol.split('/')[0]
-
-    await update.message.reply_text("📊 Analisando via TradingView... ⏳")
-
-    # Verifica se o ativo é suportado
-    if tv_key not in TV_TICKER_MAP:
-        await update.message.reply_text(
-            f"❌ `{current_symbol}` não está no mapa de ativos suportados.\n"
-            f"Use um dos ativos listados no /scan.",
-            parse_mode='Markdown',
-        )
-        return
-
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # VALIDAÇÃO DE TIER DE LIQUIDEZ (ATLAS v1.1 - Jun 2026)
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # Bloqueia análise de alts (ADA/DOGE/LTC) em horários de baixa liquidez.
-    # Evita sinais falsos causados por dojis em madrugada asiática e finais de semana.
-    # ═══════════════════════════════════════════════════════════════════════════════
-    av_type = 'forex' if tv_key.upper() in EXTERNAL_FOREX else 'crypto'
+    # Normaliza símbolo
+    symbol_base = current_symbol.split('/')[0]
     
-    # Validação de liquidez para ativos cripto
+    await update.message.reply_text("🔥 Analisando com ATLAS... ⏳")
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # VALIDAÇÃO DE LIQUIDEZ (ATLAS v1.1 - Jun 2026)
+    # ═══════════════════════════════════════════════════════════════════════════════
+    av_type = 'forex' if symbol_base.upper() in EXTERNAL_FOREX else 'crypto'
+    
     if av_type == 'crypto':
-        can_trade, liquidity_msg = _check_crypto_liquidity_session(tv_key)
-        profile = _get_crypto_signal_profile(tv_key)
+        can_trade, liquidity_msg = _check_crypto_liquidity_session(symbol_base)
+        profile = _get_crypto_signal_profile(symbol_base)
         
         if not can_trade:
             await update.message.reply_text(
                 f"⏸ **{current_symbol}** - Filtro de Liquidez Ativo\n\n"
                 f"{liquidity_msg}\n\n"
                 f"💡 **Por quê?**\n"
-                f"Ativos Tier {profile['tier']} ({profile['tier_name']}) geram muitos dojis e sinais falsos "
-                f"em horários de baixa liquidez. O sistema ATLAS bloqueia análise nestes períodos "
-                f"para proteger a qualidade dos sinais.\n\n"
+                f"Ativos Tier {profile['tier']} ({profile['tier_name']}) geram sinais falsos "
+                f"em horários de baixa liquidez. O sistema ATLAS bloqueia análise nestes períodos.\n\n"
                 f"🕐 **Quando operar {current_symbol}:**\n" +
                 (f"• Qualquer horário (liquidez 24/7)" if profile['tier'] == 1 else
                  f"• Segunda a Sexta, 07-16h UTC (Londres) ou 12-21h UTC (NY)" if profile['tier'] == 2 else
@@ -2093,141 +2075,85 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
                 parse_mode='Markdown',
             )
             return
-
-    try:
-        # Busca dados no timeframe configurado e no superior para confirmação
-        analysis_5m = _get_tv_analysis(tv_key, timeframe=current_timeframe)
-        if not analysis_5m:
-            await update.message.reply_text(f"❌ Sem dados TradingView para `{current_symbol}`.", parse_mode='Markdown')
+    
+    # Verifica sessão forex
+    if av_type == 'forex':
+        sess_ok, sess_label = _is_forex_session_active()
+        if not sess_ok:
+            await update.message.reply_text(
+                f"⏸ *{current_symbol}* é um par Forex.\n"
+                f"Sessão ativa: _{sess_label}_\n"
+                f"Sinais forex só são confiáveis nas sessões de Londres (08–16h UTC) ou NY (12–21h UTC).",
+                parse_mode='Markdown',
+            )
             return
 
-        analysis_15m = _get_tv_analysis(tv_key, timeframe=confirm_timeframe)
-
-        # Determina tipo do ativo para thresholds corretos
-        av_type = 'forex' if tv_key.upper() in EXTERNAL_FOREX else 'crypto'
-
-        # Verifica sessão forex
-        if av_type == 'forex':
-            sess_ok, sess_label = _is_forex_session_active()
-            if not sess_ok:
-                await update.message.reply_text(
-                    f"⏸ *{current_symbol}* é um par Forex.\n"
-                    f"Sessão ativa: _{sess_label}_\n"
-                    f"Sinais forex só são confiáveis na sessão de Londres (08–16h UTC) ou Nova York (12–21h UTC).",
-                    parse_mode='Markdown',
-                )
-                return
-
-        # Avalia BUY e SELL — escolhe o de maior pontuação
-        best_direction = None
-        best_score = -1
-        best_quality = ''
-        best_reasons = []
-        for direction in ('BUY', 'SELL'):
-            quality, reasons = _assess_signal_quality(analysis_5m, direction, asset_type=av_type)
-            score = sum(1 for r in reasons if r.startswith('✅'))
-            if score > best_score:
-                best_score = score
-                best_quality = quality
-                best_reasons = reasons
-                best_direction = direction
-
-        # Se ADX gate bloqueou ambas as direções (score=0), tenta sem gate p/ mostrar diagnóstico
-        if best_score == 0 and best_direction:
-            for direction in ('BUY', 'SELL'):
-                quality_ng, reasons_ng = _assess_signal_quality(
-                    analysis_5m, direction, asset_type=av_type, skip_adx_gate=True)
-                score_ng = sum(1 for r in reasons_ng if r.startswith('✅'))
-                if score_ng > best_score:
-                    best_score = score_ng
-                    best_quality = quality_ng
-                    best_reasons = reasons_ng
-                    best_direction = direction
-
-        # Confirmação 15m
-        mtf_confirmed = False
-        if analysis_15m and best_direction:
-            q15, _ = _assess_signal_quality(analysis_15m, best_direction, asset_type=av_type)
-            mtf_confirmed = 'FORTE' in q15 or 'MODERADO' in q15
-
-        close = analysis_5m.get('close')
-        rsi   = analysis_5m.get('RSI')
-        adx   = analysis_5m.get('ADX')
-        close_str = f'{close:.4g}' if close is not None else 'N/A'
-        rsi_str   = f'{rsi:.1f}'   if rsi   is not None else 'N/A'
-        adx_str   = f'{adx:.1f}'   if adx   is not None else 'N/A'
-        group = _external_asset_group(tv_key)
-
-        # Decide recomendação — 3 níveis para análise avulsa
-        dir_label = 'COMPRA' if best_direction == 'BUY' else 'VENDA'
-        safety_blocks = []
-        crypto_profile = _get_crypto_signal_profile(tv_key) if av_type == 'crypto' else None
-
-        if crypto_profile and best_direction:
-            if adx is None or adx < crypto_profile['min_adx']:
-                safety_blocks.append(
-                    f"ADX {adx_str} abaixo do minimo para {crypto_profile['tier']} ({crypto_profile['min_adx']:.0f})"
-                )
-            if rsi is not None:
-                if best_direction == 'BUY' and rsi >= crypto_profile['buy_rsi_block']:
-                    safety_blocks.append(
-                        f"RSI {rsi:.1f} esticado para compra (limite {crypto_profile['buy_rsi_block']:.0f})"
-                    )
-                if best_direction == 'SELL' and rsi <= crypto_profile['sell_rsi_block']:
-                    safety_blocks.append(
-                        f"RSI {rsi:.1f} esticado para venda (limite {crypto_profile['sell_rsi_block']:.0f})"
-                    )
-
-        # Gate de contra-tendência: Dow macro oposto → exige 5+/9 para MODERADO
-        dow_counter = any('contratendencia' in r or 'contra tendencia' in r for r in best_reasons)
-        moderado_min = 5 if dow_counter else 4
-
-        # LÓGICA CORRIGIDA: NEUTRO só quando ADX baixo (sem tendência clara)
-        # RSI extremo NÃO força NEUTRO, apenas ajusta direção/força
-        adx_too_low = False
-        rsi_reversal_signal = None
+    try:
+        # Busca dados históricos do exchange
+        df = exchange.fetch_ohlcv_dataframe(current_symbol, current_timeframe)
+        if df is None or len(df) < 50:
+            await update.message.reply_text(
+                f"❌ Sem dados suficientes para `{current_symbol}` no timeframe {current_timeframe}.",
+                parse_mode='Markdown'
+            )
+            return
         
-        if crypto_profile:
-            # ADX abaixo do mínimo = mercado lateral, SIM é NEUTRO
-            if adx is None or adx < crypto_profile['min_adx']:
-                adx_too_low = True
-            
-            # RSI extremo sugere REVERSÃO, não neutralidade
-            if rsi is not None and best_direction:
-                if best_direction == 'BUY' and rsi >= 70:
-                    # Sobrecomprado: sinal de reversão para VENDA
-                    rsi_reversal_signal = 'SELL'
-                elif best_direction == 'SELL' and rsi <= 30:
-                    # Sobrevendido: sinal de reversão para COMPRA
-                    rsi_reversal_signal = 'BUY'
+        # Calcula indicadores
+        df = analyzer.add_technical_indicators(df)
         
-        # Aplicar reversão se RSI extremo
-        if rsi_reversal_signal:
-            best_direction = rsi_reversal_signal
-            dir_label = 'COMPRA' if rsi_reversal_signal == 'BUY' else 'VENDA'
-            # Reduzir score porque é contra-indicador
-            best_score = max(best_score - 2, 3)
+        # Extrai dados do último candle
+        last = df.iloc[-1]
+        close = float(last['close'])
+        rsi = float(last.get('rsi', 50))
+        adx = float(last.get('adx', 0))
         
-        # Decisão final
-        if adx_too_low or best_score < 3:
-            # NEUTRO só quando ADX baixo OU score muito fraco
-            rec_emoji, rec_label, rec_strength = '⚪', 'NEUTRO', ''
-        elif 'FORTE' in best_quality and best_score >= 6:
-            rec_emoji = '🟢' if best_direction == 'BUY' else '🔴'
-            rec_label = dir_label
-            rec_strength = 'FORTE'
-        elif best_score >= moderado_min:
-            rec_emoji = '🟡'
-            rec_label = dir_label
-            rec_strength = 'MODERADO'
+        # Prepara signal_data básico para ATLAS
+        signal_data = {
+            'score': 0.5,  # neutro inicial
+            'probability': 50.0,
+            'rsi': rsi,
+            'adx': adx,
+        }
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # SISTEMA ATLAS - Confluence Score
+        # ═══════════════════════════════════════════════════════════════════
+        buy_analysis = confluence_system.get_confluence_score(df, 'BUY', signal_data)
+        sell_analysis = confluence_system.get_confluence_score(df, 'SELL', signal_data)
+        
+        # Escolhe a melhor direção
+        if buy_analysis['final_score'] >= sell_analysis['final_score']:
+            analysis = buy_analysis
+            direction = 'BUY'
+            dir_emoji = '🟢'
+            dir_label = 'COMPRA'
         else:
-            rec_emoji, rec_label, rec_strength = '⚪', 'NEUTRO', ''
-
-        # Próxima fronteira do timeframe configurado para entrada
-        tf_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440}
-        tf_min = tf_minutes.get(current_timeframe, 5)
+            analysis = sell_analysis
+            direction = 'SELL'
+            dir_emoji = '🔴'
+            dir_label = 'VENDA'
+        
+        score_pct = analysis['final_score_pct']
+        confluence = analysis['confluence_count']
+        recommendation = analysis['recommendation']
+        
+        # Decisão final baseada no recommendation
+        if 'STRONG' in recommendation:
+            strength = 'FORTE'
+            rec_emoji = dir_emoji
+        elif recommendation == direction:
+            strength = 'MODERADO'
+            rec_emoji = '🟡'
+        else:
+            strength = ''
+            rec_emoji = '⚪'
+            dir_label = 'NEUTRO'
+        
+        # Próximo horário de entrada
         now_local = datetime.now()
+        tf_min = timeframe_to_minutes(current_timeframe)
         if tf_min < 60:
+            import math as _math
             total_min = now_local.minute + now_local.second / 60 + 0.02
             next_tf_min = _math.ceil(total_min / tf_min) * tf_min
             if next_tf_min >= 60:
@@ -2237,58 +2163,54 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
         else:
             entry_dt = now_local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=tf_min // 60)
         entry_str = entry_dt.strftime('%H:%M')
-        expiry_label = f'{tf_min} min' if tf_min < 60 else f'{tf_min // 60}h'
-
-        mtf_tag = f'✅ {current_timeframe} + {confirm_timeframe} alinhados' if mtf_confirmed else f'⚠️ Apenas {current_timeframe} avaliado'
-        reasons_text = '\n'.join(f'  {r}' for r in best_reasons)
-
-        # Construir mensagem de ação
-        if rec_label == 'NEUTRO':
-            if adx_too_low:
-                action_line = (
-                    f"⚪ *RECOMENDAÇÃO: NEUTRO*\n"
-                    f"📊 ADX {adx_str} — mercado sem tendência clara (lateral).\n"
-                    f"⏸ Aguarde movimento direcional mais forte."
-                )
-            else:
-                action_line = (
-                    f"⚪ *RECOMENDAÇÃO: NEUTRO*\n"
-                    f"⏸ Sinal fraco ({best_score}/9 critérios). Aguarde melhor configuração."
-                )
-            if safety_blocks:
-                action_line += '\n⚠️ Observações:\n' + '\n'.join(f'  • {item}' for item in safety_blocks)
-        elif rec_strength == 'FORTE':
-            action_line = (
-                f"{rec_emoji} *RECOMENDAÇÃO: {rec_label} — FORTE*\n"
-                f"❗️ Entrada sugerida: `{entry_str}` (UTC-3) | Expiração: {expiry_label}"
+        expiry_label = f'{tf_min}min' if tf_min < 60 else f'{tf_min // 60}h'
+        
+        # Formata breakdown das técnicas
+        scores = analysis['scores']
+        techniques = {
+            'smc': ('🎯 SMC', analysis['weights']['smc']),
+            'wyckoff': ('📊 Wyckoff', analysis['weights']['wyckoff']),
+            'price_action': ('🕯 Price Action', analysis['weights']['price_action']),
+            'traditional': ('📈 Tradicional', analysis['weights']['traditional']),
+            'elliott': ('🌊 Elliott Wave', analysis['weights']['elliott']),
+        }
+        
+        breakdown_lines = []
+        for key, (name, weight) in techniques.items():
+            individual_pct = int(scores[key] * 100)
+            agreed = '✅' if key in analysis['factors_agree'] else '⚠️'
+            breakdown_lines.append(
+                f"{agreed} {name} ({int(weight*100)}%): {individual_pct}%"
             )
-            if rsi_reversal_signal:
-                action_line += f"\n🔄 Reversão esperada: RSI {rsi_str} extremo"
-        else:
-            action_line = (
-                f"{rec_emoji} *RECOMENDAÇÃO: {rec_label} — MODERADO*\n"
-                f"⚠️ Sinal presente mas não FORTE ({best_score}/9). Use com cautela.\n"
-                f"❗️ Entrada sugerida: `{entry_str}` (UTC-3) | Expiração: {expiry_label}"
-            )
-            if rsi_reversal_signal:
-                action_line += f"\n🔄 Reversão esperada: RSI {rsi_str} extremo"
-
+        
+        breakdown_text = '\n'.join(breakdown_lines)
+        
+        # Construir mensagem
         message = (
-            f"📊 *ANÁLISE — {current_symbol}* ({group})\n"
+            f"🔥 *ANÁLISE ATLAS — {current_symbol}*\n"
             f"📅 {now_local.strftime('%d/%m/%Y %H:%M:%S')}\n"
-            f"⏱ Timeframe: `{current_timeframe}` (confirmação: `{confirm_timeframe}`)\n"
-            f"💵 Preço: `{close_str}` | RSI: `{rsi_str}` | ADX: `{adx_str}`\n\n"
-            f"{action_line}\n"
-            f"_{mtf_tag}_\n\n"
-            f"📋 *Critérios ({best_score}/9):*\n"
-            f"{reasons_text}\n\n"
-            f"_Qualidade: {best_quality}_"
+            f"⏱ Timeframe: `{current_timeframe}`\n"
+            f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n\n"
+            f"{rec_emoji} *RECOMENDAÇÃO: {dir_label}" + (f" — {strength}*\n" if strength else "*\n") +
+            f"🎯 Score de Confluência: *{score_pct}%*\n"
+            f"✅ Consenso: *{confluence}/5 técnicas* concordam\n\n"
+            f"📊 *Breakdown por Técnica:*\n"
+            f"{breakdown_text}\n\n"
         )
+        
+        if dir_label != 'NEUTRO':
+            message += f"❗️ Entrada sugerida: `{entry_str}` UTC-3 | Expiração: {expiry_label}\n"
+        
+        if score_pct < 55:
+            message += "\n⚠️ *Atenção:* Score baixo — aguarde configuração mais clara"
+        elif confluence < 3:
+            message += f"\n⚠️ *Atenção:* Apenas {confluence}/5 técnicas concordam — sinal fraco"
+        
         await update.message.reply_text(message, parse_mode='Markdown')
 
     except Exception as e:
-        logger.error(f"Erro na análise avulsa: {e}")
-        await update.message.reply_text(f"❌ Erro: {str(e)}")
+        logger.error(f"Erro na análise ATLAS: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Erro na análise: {str(e)}")
 
 
 async def analise_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

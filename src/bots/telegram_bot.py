@@ -2047,15 +2047,16 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
     current_timeframe = _resolve_analysis_timeframe(timeframe)
     config.TIMEFRAME = current_timeframe
 
-    # Normaliza símbolo
-    symbol_base = current_symbol.split('/')[0]
-    
     await update.message.reply_text("🔥 Analisando com ATLAS... ⏳")
 
     # ═══════════════════════════════════════════════════════════════════════════════
-    # VALIDAÇÃO DE LIQUIDEZ (ATLAS v1.1 - Jun 2026)
+    # VALIDAÇÃO DE LIQUIDEZ E TIPO DE ATIVO (ATLAS v1.1 - Jun 2026)
     # ═══════════════════════════════════════════════════════════════════════════════
-    av_type = 'forex' if symbol_base.upper() in EXTERNAL_FOREX else 'crypto'
+    # Verifica tipo primeiro com símbolo completo (ex: GBP/JPY)
+    av_type = 'forex' if current_symbol in EXTERNAL_FOREX else 'crypto'
+    
+    # Extrai base apenas para crypto (ex: BTC/USDT → BTC)
+    symbol_base = current_symbol.split('/')[0] if av_type == 'crypto' else current_symbol
     
     if av_type == 'crypto':
         can_trade, liquidity_msg = _check_crypto_liquidity_session(symbol_base)

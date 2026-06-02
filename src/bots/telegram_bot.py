@@ -2089,8 +2089,11 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
             return
 
     try:
+        # Instancia exchange connector
+        exchange = ExchangeConnector(testnet=config.TESTNET)
+        
         # Busca dados históricos do exchange
-        df = exchange.fetch_ohlcv_dataframe(current_symbol, current_timeframe)
+        df = exchange.fetch_ohlcv(current_symbol, current_timeframe, limit=200)
         if df is None or len(df) < 50:
             await update.message.reply_text(
                 f"❌ Sem dados suficientes para `{current_symbol}` no timeframe {current_timeframe}.",
@@ -2099,7 +2102,8 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
             return
         
         # Calcula indicadores
-        df = analyzer.add_technical_indicators(df)
+        tech_indicators = TechnicalIndicators(df)
+        df = tech_indicators.calculate_all_indicators(MONITOR_INDICATORS_CONFIG)
         
         # Extrai dados do último candle
         last = df.iloc[-1]

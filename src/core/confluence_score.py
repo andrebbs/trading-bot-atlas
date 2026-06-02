@@ -53,20 +53,90 @@ class ConfluenceScoreSystem:
         self.price_action = PriceActionDetector(lookback_period=30)
         self.elliott = ElliottWaveDetector(lookback_period=100)
     
-    def calculate_traditional_score(self, df: pd.DataFrame, signal_data: Dict) -> float:
+    def calculate_traditional_score(self, df: pd.DataFrame, direction: str, signal_data: Dict | None = None) -> float:
         """
         Score baseado em indicadores tradicionais (RSI, MACD, etc)
-        Usa dados já calculados pelo TradingAnalyzer
+        Usa dados já calculados pelo TradingAnalyzer quando disponíveis e
+        aplica fallback direcional por EMA/RSI/ADX/Stoch para evitar neutro fixo.
         
         Args:
             df: DataFrame com indicadores calculados
-            signal_data: Dicionário de signal_data do analyzer
+            direction: 'BUY' ou 'SELL'
+            signal_data: Dicionário opcional de signal_data do analyzer
         
         Returns:
             Score 0.0-1.0
         """
-        # Usar score tradicional já calculado
-        return float(signal_data.get('score', 0.5))
+        # 1) Base vinda do analyzer (quando presente)
+        base_score = 0.5
+        if signal_data:
+            try:
+                base_score = float(signal_data.get('score', 0.5))
+            except (TypeError, ValueError):
+                base_score = 0.5
+
+        # 2) Fallback direcional usando indicadores já no dataframe
+        try:
+            last = df.iloc[-1]
+            close = float(last.get('close', 0.0) or 0.0)
+            ema9 = float(last.get('ema_9', last.get('ema9', 0.0)) or 0.0)
+            ema20 = float(last.get('ema_20', last.get('ema20', 0.0)) or 0.0)
+            ema50 = float(last.get('ema_50', last.get('ema50', 0.0)) or 0.0)
+            rsi = float(last.get('rsi', 50.0) or 50.0)
+            adx = float(last.get('adx', 0.0) or 0.0)
+            stoch_k = float(last.get('stoch_k', 50.0) or 50.0)
+            stoch_d = float(last.get('stoch_d', 50.0) or 50.0)
+
+            trend = 0.0
+            if close > 0 and ema9 > 0 and ema20 > 0:
+                if direction == 'BUY':
+                    if close > ema9 > ema20:
+                        trend += 0.45
+                    elif close > ema20:
+                        trend += 0.25
+                    elif close > ema50 > 0:
+                        trend += 0.10
+                else:
+                    if close < ema9 < ema20:
+                        trend += 0.45
+                    elif close < ema20:
+                        trend += 0.25
+                    elif close < ema50 > 0:
+                        trend += 0.10
+
+            momentum = 0.0
+            if direction == 'BUY':
+                if 45 <= rsi <= 70:
+                    momentum += 0.20
+                elif rsi < 45:
+                    momentum += 0.10
+                if stoch_k > stoch_d and stoch_k < 85:
+                    momentum += 0.15
+            else:
+                if 30 <= rsi <= 55:
+                    momentum += 0.20
+                elif rsi > 55:
+                    momentum += 0.10
+                if stoch_k < stoch_d and stoch_k > 15:
+                    momentum += 0.15
+
+            strength = 0.0
+            if adx >= 25:
+                strength += 0.20
+            elif adx >= 18:
+                strength += 0.10
+            elif adx >= 12:
+                strength += 0.05
+
+            directional_score = min(1.0, max(0.0, trend + momentum + strength))
+
+            # 3) Blend: privilegia leitura direcional sem ignorar analyzer
+            # Se analyzer vier neutro (0.5), a leitura direcional domina.
+            if abs(base_score - 0.5) < 0.03:
+                return directional_score
+            return min(1.0, max(0.0, (0.35 * base_score) + (0.65 * directional_score)))
+        except Exception:
+            return min(1.0, max(0.0, base_score))
     
     def get_confluence_score(
         self,
@@ -105,9 +175,9 @@ class ConfluenceScoreSystem:
         
         # 1. Tradicional (indicadores)
         if signal_data:
-            scores['traditional'] = self.calculate_traditional_score(df, signal_data)
+            scores['traditional'] = self.calculate_traditional_score(df, direction, signal_data)
         else:
-            scores['traditional'] = 0.5  # neutro se não fornecido
+            scores['traditional'] = self.calculate_traditional_score(df, direction, None)
         
         # 2. SMC
         smc_score = self.smc.get_smc_score(df, direction)

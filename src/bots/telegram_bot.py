@@ -4044,8 +4044,28 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
                 exec_block = f"\n\n⚠️ _Execução falhou: {result.get('error', 'erro')}_"
 
     interval_min = _SCAN_SIGNAL_INTERVAL // 60
+    
+    # Formata análise técnica compacta
+    tech_lines = []
+    tech_lines.append(f"💰 Preço: `{close_str}`")
+    tech_lines.append(f"📊 RSI: `{rsi_str}` | ADX: `{analysis.get('ADX', 0):.0f}`")
+    
+    # Mostra EMAs principais
+    ema9 = analysis.get('EMA9')
+    ema20 = analysis.get('EMA20')
+    if ema9 and close:
+        ema9_pct = ((close - ema9) / ema9) * 100
+        ema9_emoji = '🟢' if ema9_pct > 0 else '🔴'
+        tech_lines.append(f"{ema9_emoji} EMA9: `{ema9:.4g}` ({ema9_pct:+.2f}%)")
+    if ema20 and close:
+        ema20_pct = ((close - ema20) / ema20) * 100
+        ema20_emoji = '🟢' if ema20_pct > 0 else '🔴'
+        tech_lines.append(f"{ema20_emoji} EMA20: `{ema20:.4g}` ({ema20_pct:+.2f}%)")
+    
+    tech_block = '\n'.join(tech_lines)
+    
     msg = (
-        f"{direction_arrow} *SINAL DETECTADO — {quality}*\n\n"
+        f"{direction_arrow} *SINAL DETECTADO — {quality}* 🎯\n\n"
         f"📊 *ATIVO:* {asset} ({group})\n"
         f"❗️ *ENTRADA:* `{entry_str}` (UTC-3)\n"
         f"⏰ *TEMPO:* 5 MINUTOS\n"
@@ -4053,9 +4073,8 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
         f"_{mtf_tag}_\n\n"
         f"🚦 *PROTEÇÕES (se necessário):*\n"
         f"  1ª: `{prot1_str}` | 2ª: `{prot2_str}`\n\n"
-        f"📋 *Análise ({score}/9 critérios):*\n"
-        f"Preco: `{close_str}` | RSI: `{rsi_str}`\n"
-        f"{reasons_text}"
+        f"📈 *Análise Técnica:*\n"
+        f"{tech_block}"
         f"{eco_block}"
         f"{exec_block}\n\n"
         f"_Resultado em ~5min | Próximo sinal em ~{interval_min}min após resultado_"

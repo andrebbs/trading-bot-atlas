@@ -2989,29 +2989,36 @@ def _check_crypto_liquidity_session(asset: str) -> tuple[bool, str]:
 
 
 def _is_forex_session_active() -> tuple:
-    """Retorna (ativo: bool, label: str) indicando se há sessão forex líquida aberta.
-    Sessões consideradas (UTC):
-      Londres : 07:00 – 16:00
-      Nova York: 12:00 – 21:00
-    Overlap London+NY (12:00-16:00) = melhor momento.
-    Asiática (21:00 – 07:00) = evitar para binários de 5 min.
+    """Retorna (ativo: bool, label: str) indicando se há sessão forex aberta.
+    Forex opera 24h durante a semana, fecha apenas fim de semana.
+    Sessões (UTC):
+      Asiática (Sydney+Tóquio): 22:00 – 08:00 (menor liquidez)
+      Londres: 07:00 – 16:00 (boa liquidez)
+      Nova York: 12:00 – 21:00 (alta liquidez)
+      Overlap London+NY: 12:00 – 16:00 (melhor momento)
     """
     from datetime import timezone
     utc = datetime.now(timezone.utc)
-    # Forex spot fica fechado no fim de semana; evita alertas falsos em sábado/domingo.
+    # Forex spot fica fechado apenas no fim de semana
     if utc.weekday() >= 5:
         return False, f'Mercado fechado (fim de semana {utc.hour:02d}:{utc.minute:02d} UTC)'
 
     h = utc.hour + utc.minute / 60
     london   = 7.0 <= h < 16.0
     new_york = 12.0 <= h < 21.0
+    asian    = h >= 22.0 or h < 7.0  # 22:00-07:00 UTC
+    
     if london and new_york:
-        return True, 'London+NY overlap'
+        return True, 'London+NY overlap ⚡'
     if london:
         return True, 'Londres'
     if new_york:
         return True, 'Nova York'
-    return False, f'Sessão asiática/fechado ({utc.hour:02d}:{utc.minute:02d} UTC)'
+    if asian:
+        return True, 'Asiática (liquidez reduzida)'
+    
+    # Horários de transição (07:00-08:00, 16:00-22:00)
+    return True, f'Sessão aberta ({utc.hour:02d}:{utc.minute:02d} UTC)'
 
 
 _TV_INTERVAL_MAP = {

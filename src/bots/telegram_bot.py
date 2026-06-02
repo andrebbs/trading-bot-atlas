@@ -327,6 +327,36 @@ MONITOR_INDICATORS_CONFIG = {
 
 CURRENT_MARKET_TYPE = normalize_market_type(getattr(config, 'MARKET_TYPE', 'crypto_binary'))
 
+
+def _default_operation_market_mode() -> str:
+    """Resolve modo de mercado padrao a partir do roteamento atual."""
+    if CURRENT_MARKET_TYPE == 'forex':
+        return 'forex'
+    return 'crypto'
+
+
+_saved_market_mode = str(_load_bot_state().get('operation_market_mode') or '').strip().lower()
+_env_market_mode = str(os.getenv('OPERATION_MARKET_MODE', '') or '').strip().lower()
+OPERATION_MARKET_MODE = _saved_market_mode or _env_market_mode or _default_operation_market_mode()
+if OPERATION_MARKET_MODE not in {'crypto', 'forex'}:
+    OPERATION_MARKET_MODE = _default_operation_market_mode()
+
+
+def get_operation_market_mode() -> str:
+    """Retorna o modo operacional de mercado ativo (crypto|forex)."""
+    return OPERATION_MARKET_MODE
+
+
+def set_operation_market_mode(new_mode: str) -> bool:
+    """Atualiza e persiste o modo operacional de mercado."""
+    global OPERATION_MARKET_MODE
+    mode = (new_mode or '').strip().lower()
+    if mode not in {'crypto', 'forex'}:
+        return False
+    OPERATION_MARKET_MODE = mode
+    _save_bot_state('operation_market_mode', mode)
+    return True
+
 log_market_diagnostic(
     'bot_bootstrap',
     profile=BOT_PROFILE,
@@ -707,6 +737,9 @@ def get_operation_mode_snapshot(reference_time: datetime | None = None) -> dict:
     weekend_mode = is_weekend_binary_mode(current)
     dynamic_pool = get_active_dynamic_timeframes(current)
 
+    market_mode = get_operation_market_mode()
+    market_mode_label = 'Crypto' if market_mode == 'crypto' else 'Forex'
+
     if weekend_mode:
         return {
             'mode': 'weekend',
@@ -714,6 +747,8 @@ def get_operation_mode_snapshot(reference_time: datetime | None = None) -> dict:
             'summary': 'Range, rejeição e falsa quebra nos extremos.',
             'timeframes': dynamic_pool if monitor_timeframe_mode == 'dynamic' else [config.TIMEFRAME],
             'expires': '2 a 3 velas',
+            'market_mode': market_mode,
+            'market_mode_label': market_mode_label,
         }
 
     return {
@@ -722,6 +757,8 @@ def get_operation_mode_snapshot(reference_time: datetime | None = None) -> dict:
         'summary': 'Operacional padrão com filtros de tendência e continuidade.',
         'timeframes': dynamic_pool if monitor_timeframe_mode == 'dynamic' else [config.TIMEFRAME],
         'expires': '1 vela',
+        'market_mode': market_mode,
+        'market_mode_label': market_mode_label,
     }
 
 
@@ -1878,6 +1915,8 @@ async def notify_auto_monitor_started(context: ContextTypes.DEFAULT_TYPE):
 
     assets_crypto = [a for a in TV_TICKER_MAP if a.upper() not in EXTERNAL_FOREX]
     assets_forex  = [a for a in TV_TICKER_MAP if a.upper() in EXTERNAL_FOREX]
+    market_mode = get_operation_market_mode()
+    mode_label = 'Crypto' if market_mode == 'crypto' else 'Forex'
     forex_session_ok, forex_label = _is_forex_session_active()
     forex_status = f'✅ {forex_label}' if forex_session_ok else f'🔒 Fora de sessão ({forex_label})'
     interval_min = _SCAN_SIGNAL_INTERVAL // 60
@@ -1888,8 +1927,8 @@ async def notify_auto_monitor_started(context: ContextTypes.DEFAULT_TYPE):
             "🤖 *abbsCrypto iniciado*\n\n"
             "📡 *Scanner automático ATIVO*\n"
             f"🔬 Engine: TradingView API — 5m + 15m\n"
-            f"📊 9 critérios: EMA9/20, RSI, S/R, Dow, Fibo, Day range, ADX, PA\n"
-            f"🚦 FORTE ≥ 6/9 | ADX gate: crypto ≥ 20 | forex ≥ 25\n"
+            f"🧭 Modo operacional: *{mode_label}*\n"
+            f"🚦 Filtro de qualidade: sinais fortes + confirmação de contexto\n"
             f"🔄 Pré-análise P1: 4 min após cada entrada\n\n"
             f"💹 Crypto: {len(assets_crypto)} ativos — sempre ativo\n"
             f"💱 Forex: {len(assets_forex)} ativos — {forex_status}\n\n"
@@ -2054,9 +2093,26 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
     # ═══════════════════════════════════════════════════════════════════════════════
     # Verifica tipo primeiro com símbolo completo (ex: GBP/JPY)
     av_type = 'forex' if current_symbol in EXTERNAL_FOREX else 'crypto'
+    market_mode = get_operation_market_mode()
     
     # Extrai base apenas para crypto (ex: BTC/USDT → BTC)
     symbol_base = current_symbol.split('/')[0] if av_type == 'crypto' else current_symbol
+
+    if market_mode == 'crypto' and av_type == 'forex':
+        await update.message.reply_text(
+            f"⛔ O par `{current_symbol}` é *Forex* e o bot está em modo *Crypto*.\n"
+            "Use `/modo forex` para operar pares forex.",
+            parse_mode='Markdown'
+        )
+        return
+
+    if market_mode == 'forex' and av_type == 'crypto':
+        await update.message.reply_text(
+            f"⛔ O ativo `{current_symbol}` é *Crypto* e o bot está em modo *Forex*.\n"
+            "Use `/modo crypto` para operar criptoativos.",
+            parse_mode='Markdown'
+        )
+        return
     
     if av_type == 'crypto':
         can_trade, liquidity_msg = _check_crypto_liquidity_session(symbol_base)
@@ -2373,16 +2429,35 @@ Para mudar use:
 
 
 async def modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /modo para mostrar o modo operacional atual."""
+    """Comando /modo para mostrar ou definir modo operacional (crypto|forex)."""
+    if context.args:
+        requested_mode = (context.args[0] or '').strip().lower()
+        if requested_mode in {'crypto', 'forex'}:
+            set_operation_market_mode(requested_mode)
+            mode_label = 'Crypto' if requested_mode == 'crypto' else 'Forex'
+            await _reply_text(
+                update,
+                (
+                    f"✅ Modo operacional alterado para *{mode_label}*.\n"
+                    "Use /monitor para validar os ativos e filtros da nova configuração."
+                ),
+                parse_mode='Markdown'
+            )
+            return
+        await _reply_text(update, "❌ Uso: /modo [crypto|forex]")
+        return
+
     mode_snapshot = get_operation_mode_snapshot()
     message = (
         "🧭 Modo Operacional Atual\n\n"
         f"• Mercado: {CURRENT_MARKET_TYPE}\n"
         f"• Perfil: {BOT_PROFILE}\n"
+        f"• Segmento: {mode_snapshot['market_mode_label']}\n"
         f"• Modo: {mode_snapshot['label']}\n"
         f"• Resumo: {mode_snapshot['summary']}\n"
         f"• Timeframes ativos: {', '.join(mode_snapshot['timeframes'])}\n"
-        f"• Expiração base: {mode_snapshot['expires']}"
+        f"• Expiração base: {mode_snapshot['expires']}\n\n"
+        "Alterar: /modo crypto ou /modo forex"
     )
     await _reply_text(update, message)
 
@@ -3790,6 +3865,7 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
     candidates = []
     # Sessão forex ativa? (bloqueia pares fora de London/NY)
     forex_session_ok, forex_session_label = _is_forex_session_active()
+    market_mode = get_operation_market_mode()
 
     seen_tv = set()
     rejection_stats = {
@@ -3808,6 +3884,13 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
 
         is_forex = asset.upper() in EXTERNAL_FOREX
         asset_type = 'forex' if is_forex else 'crypto'
+
+        # Filtro por modo operacional selecionado
+        if market_mode == 'crypto' and is_forex:
+            continue
+        if market_mode == 'forex' and not is_forex:
+            continue
+
         crypto_profile = _get_crypto_signal_profile(asset) if asset_type == 'crypto' else None
 
         # Bloqueia forex fora de sessão ativa

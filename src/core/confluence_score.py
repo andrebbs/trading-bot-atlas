@@ -53,7 +53,7 @@ class ConfluenceScoreSystem:
         self.price_action = PriceActionDetector(lookback_period=30)
         self.elliott = ElliottWaveDetector(lookback_period=100)
     
-    def calculate_traditional_score(self, df: pd.DataFrame, direction: str, signal_data: Dict | None = None) -> float:
+    def calculate_traditional_score(self, df: pd.DataFrame, direction: str, signal_data: Optional[Dict] = None) -> float:
         """
         Score baseado em indicadores tradicionais (RSI, MACD, etc)
         Usa dados já calculados pelo TradingAnalyzer quando disponíveis e

@@ -24,17 +24,17 @@
 
 ### 📦 Etapa 2: Extrair Utilitários (telegram_bot.py → domain/utils/)
 
-#### 2.1 - time_utils.py (~150 linhas)
-- [ ] `timeframe_to_minutes(timeframe: str) -> int`
-- [ ] `get_next_candle_start(now: datetime, timeframe: str) -> datetime`
-- [ ] `get_pre_alert_window_seconds(timeframe: str) -> Tuple[int, int]`
-- [ ] `get_higher_timeframe(timeframe: str) -> str`
-- [ ] `parse_monitor_duration_to_minutes(raw: str)`
-- [ ] `is_weekend_binary_mode(reference_time) -> bool`
-- [ ] `get_active_dynamic_timeframes(reference_time) -> list[str]`
-- [ ] `_to_naive_utc(dt_value)`
-- [ ] `_extract_ticker_timestamp(ticker: dict)`
-- [ ] Testes manuais: /status, /analyze
+#### 2.1 - time_utils.py (~150 linhas) ✅ CONCLUÍDO
+- [x] `timeframe_to_minutes(timeframe: str) -> int`
+- [x] `get_next_candle_start(now: datetime, timeframe: str) -> datetime`
+- [x] `get_pre_alert_window_seconds(timeframe: str) -> Tuple[int, int]`
+- [x] `get_higher_timeframe(timeframe: str) -> str`
+- [x] `parse_monitor_duration_to_minutes(raw: str)`
+- [x] `direction_cooldown_elapsed(...)` 
+- [x] `_to_naive_utc(dt_value)`
+- [x] `_extract_ticker_timestamp(ticker: dict)`
+- [x] Commit: 35e8ade
+- [ ] Testes manuais: /status, /analyze (fazer depois de integrar)
 
 #### 2.2 - symbol_utils.py (~200 linhas)
 - [ ] `resolve_market_symbol(symbol: str) -> tuple`

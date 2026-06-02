@@ -2240,7 +2240,12 @@ async def analise_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         symbol = alias_map.get(raw_symbol)
         if symbol is None:
-            symbol = raw_symbol if '/' in raw_symbol else f'{raw_symbol}/USDT'
+            # Se é forex (com ou sem barra), usa direto
+            if raw_symbol in EXTERNAL_FOREX or raw_symbol.replace('/', '') in EXTERNAL_FOREX:
+                symbol = raw_symbol
+            # Senão, adiciona /USDT para crypto
+            else:
+                symbol = raw_symbol if '/' in raw_symbol else f'{raw_symbol}/USDT'
 
         if len(context.args) > 1:
             timeframe = (context.args[1] or '').strip().lower()

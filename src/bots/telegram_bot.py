@@ -2562,20 +2562,28 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             remaining_exp = max(0, int(p['expiry_ts'] - time.time()))
             pending_info = f"\n📌 Sinal pendente: {p['asset']} {p['direction']} — expira em {remaining_exp}s"
 
-        assets_crypto = [a for a in TV_TICKER_MAP if a.upper() not in EXTERNAL_FOREX]
-        assets_forex  = [a for a in TV_TICKER_MAP if a.upper() in EXTERNAL_FOREX]
+        # Separa ativos por categoria real (não mistura crypto com ações/commodities)
+        crypto_tier1 = sorted(CRYPTO_TIER1_SYMBOLS)
+        crypto_tier2 = sorted(CRYPTO_TIER2_SYMBOLS)
+        crypto_tier3 = sorted(CRYPTO_TIER3_SYMBOLS)
+        total_crypto = len(crypto_tier1) + len(crypto_tier2) + len(crypto_tier3)
+        
+        assets_forex = [a for a in TV_TICKER_MAP if a.upper() in EXTERNAL_FOREX]
         forex_session_ok, forex_label = _is_forex_session_active()
         forex_status = f'✅ {forex_label}' if forex_session_ok else f'🔒 Bloqueado ({forex_label})'
 
         await _reply_text(
             update,
             f"📡 *Scanner automático: {status_icon}*{cooldown_info}{pending_info}\n\n"
-            f"🔬 *Engine:* TradingView API (5m + 15m)\n"
-            f"📊 *Critérios:* 9 pontos — EMA, RSI, Dow, Fibo, ADX, PA, S/R, Day range\n"
-            f"🚦 *FORTE:* ≥ 6/9 critérios em 5m, confirmado em 15m\n"
-            f"🛡 *ADX gate:* crypto ≥ 20 | forex ≥ 25\n\n"
-            f"💹 *Crypto ({len(assets_crypto)}):* {', '.join(assets_crypto)}\n"
-            f"💱 *Forex ({len(assets_forex)}):* {', '.join(assets_forex[:6])}...\n"
+            f"🔥 *Engine:* ATLAS — Sistema de Confluência (5 técnicas)\n"
+            f"📊 *Técnicas:* SMC (30%), Wyckoff (25%), Price Action (20%), Tradicional (15%), Elliott (10%)\n"
+            f"🎯 *Consenso:* ≥ 3/5 técnicas + Score ≥ 65%\n"
+            f"🛡 *Filtros:* Tier liquidez + ADX + Sessão ativa\n\n"
+            f"💹 *Crypto ({total_crypto} ativos com TIER):*\n"
+            f"  • TIER 1 (24/7): {', '.join(crypto_tier1)}\n"
+            f"  • TIER 2 (Sessão): {', '.join(crypto_tier2)}\n"
+            f"  • TIER 3 (Overlap): {', '.join(crypto_tier3)}\n\n"
+            f"💱 *Forex ({len(assets_forex)} pares):* {', '.join(assets_forex[:6])}...\n"
             f"🌐 *Sessão forex:* {forex_status}\n\n"
             f"⏱ *Varredura:* a cada 5 min | Cooldown: {_SCAN_SIGNAL_INTERVAL // 60} min entre sinais\n"
             f"🔄 *Pré-análise P1:* ativa (4 min após entrada)\n\n"
@@ -2586,21 +2594,34 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── LIGAR ─────────────────────────────────────────────────────────────
     if arg in ('on', 'ativar', 'ligar', '1'):
         _auto_scan_active = True
-        assets_crypto = [a for a in TV_TICKER_MAP if a.upper() not in EXTERNAL_FOREX]
-        assets_forex  = [a for a in TV_TICKER_MAP if a.upper() in EXTERNAL_FOREX]
+        
+        # Separa crypto real (com tier) de outros ativos
+        crypto_tier1 = sorted(CRYPTO_TIER1_SYMBOLS)
+        crypto_tier2 = sorted(CRYPTO_TIER2_SYMBOLS)
+        crypto_tier3 = sorted(CRYPTO_TIER3_SYMBOLS)
+        total_crypto = len(crypto_tier1) + len(crypto_tier2) + len(crypto_tier3)
+        
+        assets_forex = [a for a in TV_TICKER_MAP if a.upper() in EXTERNAL_FOREX]
         forex_session_ok, forex_label = _is_forex_session_active()
         forex_status = f'✅ {forex_label}' if forex_session_ok else f'🔒 Fora de sessão ({forex_label})'
         interval_min = _SCAN_SIGNAL_INTERVAL // 60
+        
         await _reply_text(
             update,
             "✅ *Scanner ATIVADO*\n\n"
-            f"🔬 Engine: TradingView — 5m + 15m confirmação\n"
-            f"📊 9 critérios: EMA9/20, RSI, S/R, Dow, Fibo, Day range, ADX, Price Action\n"
-            f"🚦 Sinal enviado apenas se FORTE (≥ 6/9) em 5m + confirmação 15m\n"
-            f"🛡 ADX gate: crypto ≥ 20 | forex ≥ 25\n"
-            f"🔄 Pré-análise P1: sim (4 min após entrada)\n\n"
-            f"💹 Crypto ({len(assets_crypto)} ativos) — sempre ativo\n"
-            f"💱 Forex ({len(assets_forex)} ativos) — {forex_status}\n\n"
+            f"🔥 *Engine:* ATLAS — Sistema de Confluência\n"
+            f"📊 *5 Técnicas:* SMC 30% | Wyckoff 25% | Price Action 20% | Tradicional 15% | Elliott 10%\n"
+            f"🎯 *Threshold:* ≥ 3/5 técnicas concordam + Score ≥ 65%\n"
+            f"🛡 *Filtros inteligentes:*\n"
+            f"  • TIER 1 (BTC/ETH): ADX ≥ 24, opera 24/7\n"
+            f"  • TIER 2 (SOL/XRP/BNB): ADX ≥ 26, sessão Londres/NY\n"
+            f"  • TIER 3 (Alts): ADX ≥ 30, apenas overlap Londres+NY\n"
+            f"🔄 *Pré-análise P1:* sim (4 min após entrada)\n\n"
+            f"💹 *Crypto ({total_crypto} ativos):*\n"
+            f"  🟢 TIER 1: {', '.join(crypto_tier1)}\n"
+            f"  🟡 TIER 2: {', '.join(crypto_tier2)}\n"
+            f"  🔴 TIER 3: {', '.join(crypto_tier3)}\n\n"
+            f"💱 *Forex ({len(assets_forex)} pares):* {forex_status}\n\n"
             f"⏱ Varredura: cada 5 min | Cooldown: {interval_min} min entre sinais\n\n"
             "_O bot avisará automaticamente quando encontrar sinal qualificado._"
         )

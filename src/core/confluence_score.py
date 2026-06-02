@@ -77,15 +77,24 @@ class ConfluenceScoreSystem:
 
         # 2) Fallback direcional usando indicadores já no dataframe
         try:
+            def _safe_float(value, default: float) -> float:
+                try:
+                    v = float(value)
+                except (TypeError, ValueError):
+                    return default
+                if np.isnan(v) or np.isinf(v):
+                    return default
+                return v
+
             last = df.iloc[-1]
-            close = float(last.get('close', 0.0) or 0.0)
-            ema9 = float(last.get('ema_9', last.get('ema9', 0.0)) or 0.0)
-            ema20 = float(last.get('ema_20', last.get('ema20', 0.0)) or 0.0)
-            ema50 = float(last.get('ema_50', last.get('ema50', 0.0)) or 0.0)
-            rsi = float(last.get('rsi', 50.0) or 50.0)
-            adx = float(last.get('adx', 0.0) or 0.0)
-            stoch_k = float(last.get('stoch_k', 50.0) or 50.0)
-            stoch_d = float(last.get('stoch_d', 50.0) or 50.0)
+            close = _safe_float(last.get('close', 0.0), 0.0)
+            ema9 = _safe_float(last.get('ema_9', last.get('ema9', 0.0)), 0.0)
+            ema20 = _safe_float(last.get('ema_20', last.get('ema20', 0.0)), 0.0)
+            ema50 = _safe_float(last.get('ema_50', last.get('ema50', 0.0)), 0.0)
+            rsi = _safe_float(last.get('rsi', 50.0), 50.0)
+            adx = _safe_float(last.get('adx', 0.0), 0.0)
+            stoch_k = _safe_float(last.get('stoch_k', 50.0), 50.0)
+            stoch_d = _safe_float(last.get('stoch_d', 50.0), 50.0)
 
             trend = 0.0
             if close > 0 and ema9 > 0 and ema20 > 0:
@@ -106,16 +115,16 @@ class ConfluenceScoreSystem:
 
             momentum = 0.0
             if direction == 'BUY':
-                if 45 <= rsi <= 70:
+                if 52 <= rsi <= 70:
                     momentum += 0.20
-                elif rsi < 45:
+                elif 45 <= rsi < 52:
                     momentum += 0.10
                 if stoch_k > stoch_d and stoch_k < 85:
                     momentum += 0.15
             else:
-                if 30 <= rsi <= 55:
+                if 30 <= rsi <= 48:
                     momentum += 0.20
-                elif rsi > 55:
+                elif 48 < rsi <= 55:
                     momentum += 0.10
                 if stoch_k < stoch_d and stoch_k > 15:
                     momentum += 0.15

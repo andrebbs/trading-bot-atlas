@@ -2184,6 +2184,9 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
         close = float(last['close'])
         rsi = float(last.get('rsi', 50))
         adx = float(last.get('adx', 0))
+        stoch_k = float(last.get('stoch_k', 50) if pd.notna(last.get('stoch_k', 50)) else 50)
+        stoch_d = float(last.get('stoch_d', 50) if pd.notna(last.get('stoch_d', 50)) else 50)
+        ema9 = float(last.get('ema_9', last.get('ema9', close)) if pd.notna(last.get('ema_9', last.get('ema9', close))) else close)
         
         # Prepara signal_data básico para ATLAS
         signal_data = {
@@ -2268,16 +2271,34 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
             f"🔥 *ANÁLISE ATLAS — {current_symbol}*\n"
             f"📅 {now_local.strftime('%d/%m/%Y %H:%M:%S')}\n"
             f"⏱ Timeframe: `{current_timeframe}`\n"
-            f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n\n"
+            f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n"
+            f"📉 Stoch K/D: `{stoch_k:.1f}/{stoch_d:.1f}`\n\n"
             f"{rec_emoji} *RECOMENDAÇÃO: {dir_label}" + (f" — {strength}*\n" if strength else "*\n") +
             f"🎯 Score de Confluência: *{score_pct}%*\n"
             f"✅ Consenso: *{confluence}/5 técnicas* concordam\n\n"
             f"📊 *Breakdown por Técnica:*\n"
             f"{breakdown_text}\n\n"
         )
+
+        # Viés tático para curto prazo (scalp) quando mercado está sem tendência clara.
+        tactical_lines = []
+        if adx < 15:
+            bullish_tactical = stoch_k > stoch_d and stoch_k < 35 and close >= ema9
+            bearish_tactical = stoch_k < stoch_d and stoch_k > 65 and close <= ema9
+            if bullish_tactical:
+                tactical_lines.append("🟢 *Viés tático (scalp):* compra de curto prazo possível")
+                tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para cima em região descontada")
+                tactical_lines.append("• Perfil: operação rápida e de maior risco")
+            elif bearish_tactical:
+                tactical_lines.append("🔴 *Viés tático (scalp):* venda de curto prazo possível")
+                tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para baixo em região esticada")
+                tactical_lines.append("• Perfil: operação rápida e de maior risco")
         
         if dir_label != 'NEUTRO':
             message += f"❗️ Entrada sugerida: `{entry_str}` UTC-3 | Expiração: {expiry_label}\n"
+
+        if tactical_lines:
+            message += "\n" + "\n".join(tactical_lines) + "\n"
         
         if score_pct < 55:
             message += "\n⚠️ *Atenção:* Score baixo — aguarde configuração mais clara"

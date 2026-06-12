@@ -2231,9 +2231,12 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
             confluence_emoji = '⚪'
         
         # Decisão final baseada no recommendation
-        if 'STRONG' in recommendation:
+        if recommendation.startswith('STRONG_'):
             strength = 'FORTE'
             rec_emoji = dir_emoji
+        elif recommendation.startswith('WEAK_'):
+            strength = 'FRACO'
+            rec_emoji = '🟠'
         elif recommendation == direction:
             strength = 'MODERADO'
             rec_emoji = '🟡'
@@ -2321,6 +2324,7 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
             f"📉 Stoch K/D: `{stoch_k:.1f}/{stoch_d:.1f}`\n\n"
             f"{rec_emoji} *RECOMENDAÇÃO: {dir_label}" + (f" — {strength}*\n" if strength else "*\n") +
             f"🎯 Score de Confluência: *{score_pct}%* (bruto: {raw_score_pct}%)\n"
+            f"🧪 Classificação ATLAS: *{recommendation}*\n"
             f"✅ Consenso: *{confluence}/5 técnicas* concordam\n\n"
             f"{confluence_emoji} *Confluência Operacional: {confluence_label}*\n"
             f"✅ A favor: *{factors_pro}* | ❌ Contra: *{factors_contra}* | ⚪ Neutras: *{factors_neutral}*\n\n"
@@ -2345,13 +2349,15 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
                 tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para baixo em região esticada")
                 tactical_lines.append("• Perfil: operação rápida e de maior risco")
         
-        if dir_label != 'NEUTRO':
+        if dir_label != 'NEUTRO' and not recommendation.startswith('WEAK_'):
             message += f"❗️ Entrada sugerida: `{entry_str}` UTC-3 | Expiração: {expiry_label}\n"
 
         if tactical_lines:
             message += "\n" + "\n".join(tactical_lines) + "\n"
         
-        if score_pct < 55:
+        if recommendation.startswith('WEAK_'):
+            message += "\n⚠️ *Atenção:* Sinal fraco (WEAK) — sem entrada recomendada"
+        elif score_pct < 55:
             message += "\n⚠️ *Atenção:* Score baixo — aguarde configuração mais clara"
         elif confluence < 3:
             message += f"\n⚠️ *Atenção:* Apenas {confluence}/5 técnicas concordam — sinal fraco"

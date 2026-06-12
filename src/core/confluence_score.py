@@ -48,15 +48,15 @@ class ConfluenceScoreSystem:
 
     # Ajustes para evitar score artificialmente deprimido quando poucas técnicas
     # estão ativas no candle atual (cenário comum em 1m/5m).
-    ACTIVE_TECHNIQUE_MIN_SCORE = float(os.getenv('ATLAS_ACTIVE_TECHNIQUE_MIN_SCORE', '0.12'))
-    NORMALIZATION_BIAS = float(os.getenv('ATLAS_NORMALIZATION_BIAS', '0.75'))
-    AGREEMENT_THRESHOLD = float(os.getenv('ATLAS_AGREEMENT_THRESHOLD', '0.25'))
+    ACTIVE_TECHNIQUE_MIN_SCORE = float(os.getenv('ATLAS_ACTIVE_TECHNIQUE_MIN_SCORE', '0.20'))
+    NORMALIZATION_BIAS = float(os.getenv('ATLAS_NORMALIZATION_BIAS', '0.45'))
+    AGREEMENT_THRESHOLD = float(os.getenv('ATLAS_AGREEMENT_THRESHOLD', '0.30'))
 
-    # Limiar de recomendação (env configurável sem alterar código).
-    STRONG_MIN_SCORE = float(os.getenv('ATLAS_STRONG_MIN_SCORE', '0.60'))
-    STRONG_MIN_CONFLUENCE = int(os.getenv('ATLAS_STRONG_MIN_CONFLUENCE', '3'))
-    MIN_SCORE = float(os.getenv('ATLAS_MIN_SCORE', '0.30'))
-    MIN_CONFLUENCE = int(os.getenv('ATLAS_MIN_CONFLUENCE', '2'))
+    STRONG_MIN_SCORE = float(os.getenv('ATLAS_STRONG_MIN_SCORE', '0.68'))
+    STRONG_MIN_CONFLUENCE = int(os.getenv('ATLAS_STRONG_MIN_CONFLUENCE', '4'))
+    MIN_SCORE = float(os.getenv('ATLAS_MIN_SCORE', '0.50'))
+    MIN_CONFLUENCE = int(os.getenv('ATLAS_MIN_CONFLUENCE', '3'))
+
     
     def __init__(self):
         """Inicializa todos os detectores"""
@@ -230,12 +230,30 @@ class ConfluenceScoreSystem:
             for technique, weight in self.WEIGHTS.items()
             if scores.get(technique, 0.0) >= self.ACTIVE_TECHNIQUE_MIN_SCORE
         )
+        # ----------------------------
+        # NORMALIZAÇÃO
+        # ----------------------------
         normalized_score = raw_score / active_weight if active_weight > 0 else raw_score
         normalized_score = min(1.0, max(0.0, normalized_score))
-        
-        # Blend entre score bruto e normalizado.
-        final_score = ((1.0 - self.NORMALIZATION_BIAS) * raw_score) + (self.NORMALIZATION_BIAS * normalized_score)
+
+        # ----------------------------
+        # PENALIZAÇÃO POR COBERTURA
+        # ----------------------------
+        coverage_ratio = active_weight  # total = 1.0
+
+        coverage_penalty = 0.55 + (0.45 * coverage_ratio)
+
+        # ----------------------------
+        # BLEND MAIS CONSERVADOR
+        # ----------------------------
+        blended_score = (
+            (0.5 * raw_score) +
+            (0.5 * normalized_score)
+        )
+
+        final_score = blended_score * coverage_penalty
         final_score = min(1.0, max(0.0, final_score))
+
         final_score_pct = int(round(final_score * 100))
         raw_score_pct = int(round(raw_score * 100))
         
@@ -289,17 +307,22 @@ class ConfluenceScoreSystem:
         # Critérios padrão calibrados para curto prazo, configuráveis via env.
         if score >= self.STRONG_MIN_SCORE and confluence_count >= self.STRONG_MIN_CONFLUENCE:
             return f'STRONG_{direction}'
-        elif score >= self.MIN_SCORE and confluence_count >= self.MIN_CONFLUENCE:
+
+        if score >= self.MIN_SCORE and confluence_count >= self.MIN_CONFLUENCE:
             return direction
-        else:
-            return 'NEUTRAL'
+
+        # Nível fraco para leitura direcional com baixa convicção.
+        if score >= 0.40 and confluence_count >= 2:
+            return f'WEAK_{direction}'
+
+        return 'NEUTRAL'
     
     def should_enter_trade(
         self,
         df: pd.DataFrame,
         direction: str,
         signal_data: Optional[Dict] = None,
-        min_score: float = 0.55,
+        min_score: float = 0.58,
         min_confluence: int = 3
     ) -> Tuple[bool, Dict]:
         """
@@ -317,28 +340,44 @@ class ConfluenceScoreSystem:
         """
         analysis = self.get_confluence_score(df, direction, signal_data)
         
-        # Critérios:
-        # 1. Score final >= threshold
-        # 2. Confluência >= mínimo
-        # 3. SMC não deve ser ranging (bloqueio absoluto)
-        
-        # Verificar estrutura SMC
+        # 1) Bloquear sinais fracos
+        recommendation = analysis.get('recommendation', 'NEUTRAL')
+        if recommendation.startswith('WEAK'):
+            analysis['block_reason'] = 'Sinal fraco - baixa qualidade'
+            return False, analysis
+
+        if recommendation == 'NEUTRAL':
+            analysis['block_reason'] = 'Sem confluência'
+            return False, analysis
+
+        # 2) Filtro SMC
         smc_analysis = self.smc.get_analysis(df)
         if smc_analysis['structure'] == 'ranging':
-            analysis['block_reason'] = 'SMC: mercado lateralizado (ranging)'
+            analysis['block_reason'] = 'Mercado lateral (SMC)'
             return False, analysis
-        
-        # Verificar score
+
+        # 3) Filtro de volatilidade
+        try:
+            atr = float(df['atr'].iloc[-1])
+            price = float(df['close'].iloc[-1])
+            volatility = (atr / price) if price > 0 else 0.0
+
+            if volatility < 0.003:
+                analysis['block_reason'] = 'Baixa volatilidade'
+                return False, analysis
+        except Exception:
+            pass
+
+        # 4) Verificar score
         if analysis['final_score'] < min_score:
-            analysis['block_reason'] = f'Score insuficiente ({analysis["final_score"]:.2f} < {min_score})'
+            analysis['block_reason'] = f'Score baixo ({analysis["final_score"]:.2f})'
             return False, analysis
-        
-        # Verificar confluência
+
+        # 5) Verificar confluência
         if analysis['confluence_count'] < min_confluence:
-            analysis['block_reason'] = f'Poucas confirmações ({analysis["confluence_count"]} < {min_confluence})'
+            analysis['block_reason'] = f'Pouca confluência ({analysis["confluence_count"]})'
             return False, analysis
-        
-        # Passou em todos os critérios!
+
         analysis['block_reason'] = None
         return True, analysis
     

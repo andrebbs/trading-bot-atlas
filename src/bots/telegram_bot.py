@@ -2215,8 +2215,20 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
             dir_label = 'VENDA'
         
         score_pct = analysis['final_score_pct']
+        raw_score_pct = analysis.get('raw_score_pct', score_pct)
         confluence = analysis['confluence_count']
         recommendation = analysis['recommendation']
+
+        # Classificação operacional de confluência (mais útil para decisão)
+        if confluence >= 4 and score_pct >= 60:
+            confluence_label = 'FORTE'
+            confluence_emoji = '🟢'
+        elif confluence >= 2 and score_pct >= 35:
+            confluence_label = 'MEDIA'
+            confluence_emoji = '🟡'
+        else:
+            confluence_label = 'FRACA'
+            confluence_emoji = '⚪'
         
         # Decisão final baseada no recommendation
         if 'STRONG' in recommendation:
@@ -2257,14 +2269,48 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
         }
         
         breakdown_lines = []
+        directional_lines = []
+        factors_pro = 0
+        factors_contra = 0
+        factors_neutral = 0
         for key, (name, weight) in techniques.items():
             individual_pct = int(scores[key] * 100)
+            contribution_pct = int(round(scores[key] * weight * 100))
             agreed = '✅' if key in analysis['factors_agree'] else '⚠️'
+
+            buy_val = float(buy_analysis['scores'].get(key, 0.0))
+            sell_val = float(sell_analysis['scores'].get(key, 0.0))
+            dominant = max(buy_val, sell_val)
+            diff = abs(buy_val - sell_val)
+
+            if dominant < 0.20 or diff < 0.08:
+                side = 'NEUTRO'
+                side_emoji = '⚪'
+                factors_neutral += 1
+            elif buy_val > sell_val:
+                side = 'COMPRA'
+                side_emoji = '🟢'
+                if direction == 'BUY':
+                    factors_pro += 1
+                else:
+                    factors_contra += 1
+            else:
+                side = 'VENDA'
+                side_emoji = '🔴'
+                if direction == 'SELL':
+                    factors_pro += 1
+                else:
+                    factors_contra += 1
+
             breakdown_lines.append(
-                f"{agreed} {name} ({int(weight*100)}%): {individual_pct}%"
+                f"{agreed} {name} ({int(weight*100)}%): {individual_pct}% (contrib: {contribution_pct}pp)"
+            )
+            directional_lines.append(
+                f"{side_emoji} {name}: {side} (B:{int(round(buy_val * 100))}% | S:{int(round(sell_val * 100))}%)"
             )
         
         breakdown_text = '\n'.join(breakdown_lines)
+        directional_text = '\n'.join(directional_lines)
         
         # Construir mensagem
         message = (
@@ -2274,10 +2320,15 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
             f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n"
             f"📉 Stoch K/D: `{stoch_k:.1f}/{stoch_d:.1f}`\n\n"
             f"{rec_emoji} *RECOMENDAÇÃO: {dir_label}" + (f" — {strength}*\n" if strength else "*\n") +
-            f"🎯 Score de Confluência: *{score_pct}%*\n"
+            f"🎯 Score de Confluência: *{score_pct}%* (bruto: {raw_score_pct}%)\n"
             f"✅ Consenso: *{confluence}/5 técnicas* concordam\n\n"
+            f"{confluence_emoji} *Confluência Operacional: {confluence_label}*\n"
+            f"✅ A favor: *{factors_pro}* | ❌ Contra: *{factors_contra}* | ⚪ Neutras: *{factors_neutral}*\n\n"
             f"📊 *Breakdown por Técnica:*\n"
             f"{breakdown_text}\n\n"
+            f"🧭 *Direção por Técnica:*\n"
+            f"{directional_text}\n\n"
+            f"ℹ️ Pesos (30%, 25%...) representam importância no modelo, não probabilidade de acerto.\n\n"
         )
 
         # Viés tático para curto prazo (scalp) quando mercado está sem tendência clara.

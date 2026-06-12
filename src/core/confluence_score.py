@@ -45,6 +45,18 @@ class ConfluenceScoreSystem:
         'price_action': 0.20, # Price Action médio (padrões confiáveis)
         'elliott': 0.10       # Elliott baixo (mais subjetivo)
     }
+
+    # Ajustes para evitar score artificialmente deprimido quando poucas técnicas
+    # estão ativas no candle atual (cenário comum em 1m/5m).
+    ACTIVE_TECHNIQUE_MIN_SCORE = float(os.getenv('ATLAS_ACTIVE_TECHNIQUE_MIN_SCORE', '0.12'))
+    NORMALIZATION_BIAS = float(os.getenv('ATLAS_NORMALIZATION_BIAS', '0.75'))
+    AGREEMENT_THRESHOLD = float(os.getenv('ATLAS_AGREEMENT_THRESHOLD', '0.25'))
+
+    # Limiar de recomendação (env configurável sem alterar código).
+    STRONG_MIN_SCORE = float(os.getenv('ATLAS_STRONG_MIN_SCORE', '0.60'))
+    STRONG_MIN_CONFLUENCE = int(os.getenv('ATLAS_STRONG_MIN_CONFLUENCE', '3'))
+    MIN_SCORE = float(os.getenv('ATLAS_MIN_SCORE', '0.30'))
+    MIN_CONFLUENCE = int(os.getenv('ATLAS_MIN_CONFLUENCE', '2'))
     
     def __init__(self):
         """Inicializa todos os detectores"""
@@ -204,16 +216,31 @@ class ConfluenceScoreSystem:
         elliott_score = self.elliott.get_elliott_score(df, direction)
         scores['elliott'] = elliott_score
         
-        # Calcular score final ponderado
-        final_score = 0.0
+        # Score bruto ponderado (0-1)
+        raw_score = 0.0
         for technique, weight in self.WEIGHTS.items():
-            final_score += scores[technique] * weight
+            raw_score += scores[technique] * weight
+
+        raw_score = min(1.0, max(0.0, raw_score))
+
+        # Score normalizado por técnicas efetivamente ativas para reduzir
+        # falso "sempre neutro" quando detectores de padrão não disparam.
+        active_weight = sum(
+            weight
+            for technique, weight in self.WEIGHTS.items()
+            if scores.get(technique, 0.0) >= self.ACTIVE_TECHNIQUE_MIN_SCORE
+        )
+        normalized_score = raw_score / active_weight if active_weight > 0 else raw_score
+        normalized_score = min(1.0, max(0.0, normalized_score))
         
+        # Blend entre score bruto e normalizado.
+        final_score = ((1.0 - self.NORMALIZATION_BIAS) * raw_score) + (self.NORMALIZATION_BIAS * normalized_score)
         final_score = min(1.0, max(0.0, final_score))
-        final_score_pct = int(final_score * 100)
+        final_score_pct = int(round(final_score * 100))
+        raw_score_pct = int(round(raw_score * 100))
         
-        # Contar confluências (score > 0.4 = concorda)
-        agreement_threshold = 0.4
+        # Contar confluências (score >= limiar = concorda)
+        agreement_threshold = self.AGREEMENT_THRESHOLD
         factors_agree = []
         factors_disagree = []
         
@@ -235,6 +262,9 @@ class ConfluenceScoreSystem:
         return {
             'final_score': final_score,
             'final_score_pct': final_score_pct,
+            'raw_score': raw_score,
+            'raw_score_pct': raw_score_pct,
+            'normalized_score': normalized_score,
             'direction': direction,
             'scores': scores,
             'confluence_count': confluence_count,
@@ -256,14 +286,10 @@ class ConfluenceScoreSystem:
         Returns:
             String de recomendação
         """
-        # Critérios:
-        # STRONG: score >= 0.7 E confluência >= 4
-        # Normal: score >= 0.55 E confluência >= 3
-        # NEUTRAL: score < 0.55 OU confluência < 3
-        
-        if score >= 0.70 and confluence_count >= 4:
+        # Critérios padrão calibrados para curto prazo, configuráveis via env.
+        if score >= self.STRONG_MIN_SCORE and confluence_count >= self.STRONG_MIN_CONFLUENCE:
             return f'STRONG_{direction}'
-        elif score >= 0.55 and confluence_count >= 3:
+        elif score >= self.MIN_SCORE and confluence_count >= self.MIN_CONFLUENCE:
             return direction
         else:
             return 'NEUTRAL'

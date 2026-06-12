@@ -45,6 +45,18 @@ class ConfluenceScoreSystem:
         'price_action': 0.20, # Price Action médio (padrões confiáveis)
         'elliott': 0.10       # Elliott baixo (mais subjetivo)
     }
+
+    # Ajustes para evitar score artificialmente deprimido quando poucas técnicas
+    # estão ativas no candle atual (cenário comum em 1m/5m).
+    ACTIVE_TECHNIQUE_MIN_SCORE = float(os.getenv('ATLAS_ACTIVE_TECHNIQUE_MIN_SCORE', '0.20'))
+    NORMALIZATION_BIAS = float(os.getenv('ATLAS_NORMALIZATION_BIAS', '0.45'))
+    AGREEMENT_THRESHOLD = float(os.getenv('ATLAS_AGREEMENT_THRESHOLD', '0.30'))
+
+    STRONG_MIN_SCORE = float(os.getenv('ATLAS_STRONG_MIN_SCORE', '0.68'))
+    STRONG_MIN_CONFLUENCE = int(os.getenv('ATLAS_STRONG_MIN_CONFLUENCE', '4'))
+    MIN_SCORE = float(os.getenv('ATLAS_MIN_SCORE', '0.50'))
+    MIN_CONFLUENCE = int(os.getenv('ATLAS_MIN_CONFLUENCE', '3'))
+
     
     def __init__(self):
         """Inicializa todos os detectores"""
@@ -53,20 +65,99 @@ class ConfluenceScoreSystem:
         self.price_action = PriceActionDetector(lookback_period=30)
         self.elliott = ElliottWaveDetector(lookback_period=100)
     
-    def calculate_traditional_score(self, df: pd.DataFrame, signal_data: Dict) -> float:
+    def calculate_traditional_score(self, df: pd.DataFrame, direction: str, signal_data: Optional[Dict] = None) -> float:
         """
         Score baseado em indicadores tradicionais (RSI, MACD, etc)
-        Usa dados já calculados pelo TradingAnalyzer
+        Usa dados já calculados pelo TradingAnalyzer quando disponíveis e
+        aplica fallback direcional por EMA/RSI/ADX/Stoch para evitar neutro fixo.
         
         Args:
             df: DataFrame com indicadores calculados
-            signal_data: Dicionário de signal_data do analyzer
+            direction: 'BUY' ou 'SELL'
+            signal_data: Dicionário opcional de signal_data do analyzer
         
         Returns:
             Score 0.0-1.0
         """
-        # Usar score tradicional já calculado
-        return float(signal_data.get('score', 0.5))
+        # 1) Base vinda do analyzer (quando presente)
+        base_score = 0.5
+        if signal_data:
+            try:
+                base_score = float(signal_data.get('score', 0.5))
+            except (TypeError, ValueError):
+                base_score = 0.5
+
+        # 2) Fallback direcional usando indicadores já no dataframe
+        try:
+            def _safe_float(value, default: float) -> float:
+                try:
+                    v = float(value)
+                except (TypeError, ValueError):
+                    return default
+                if np.isnan(v) or np.isinf(v):
+                    return default
+                return v
+
+            last = df.iloc[-1]
+            close = _safe_float(last.get('close', 0.0), 0.0)
+            ema9 = _safe_float(last.get('ema_9', last.get('ema9', 0.0)), 0.0)
+            ema20 = _safe_float(last.get('ema_20', last.get('ema20', 0.0)), 0.0)
+            ema50 = _safe_float(last.get('ema_50', last.get('ema50', 0.0)), 0.0)
+            rsi = _safe_float(last.get('rsi', 50.0), 50.0)
+            adx = _safe_float(last.get('adx', 0.0), 0.0)
+            stoch_k = _safe_float(last.get('stoch_k', 50.0), 50.0)
+            stoch_d = _safe_float(last.get('stoch_d', 50.0), 50.0)
+
+            trend = 0.0
+            if close > 0 and ema9 > 0 and ema20 > 0:
+                if direction == 'BUY':
+                    if close > ema9 > ema20:
+                        trend += 0.45
+                    elif close > ema20:
+                        trend += 0.25
+                    elif close > ema50 > 0:
+                        trend += 0.10
+                else:
+                    if close < ema9 < ema20:
+                        trend += 0.45
+                    elif close < ema20:
+                        trend += 0.25
+                    elif close < ema50 > 0:
+                        trend += 0.10
+
+            momentum = 0.0
+            if direction == 'BUY':
+                if 52 <= rsi <= 70:
+                    momentum += 0.20
+                elif 45 <= rsi < 52:
+                    momentum += 0.10
+                if stoch_k > stoch_d and stoch_k < 85:
+                    momentum += 0.15
+            else:
+                if 30 <= rsi <= 48:
+                    momentum += 0.20
+                elif 48 < rsi <= 55:
+                    momentum += 0.10
+                if stoch_k < stoch_d and stoch_k > 15:
+                    momentum += 0.15
+
+            strength = 0.0
+            if adx >= 25:
+                strength += 0.20
+            elif adx >= 18:
+                strength += 0.10
+            elif adx >= 12:
+                strength += 0.05
+
+            directional_score = min(1.0, max(0.0, trend + momentum + strength))
+
+            # 3) Blend: privilegia leitura direcional sem ignorar analyzer
+            # Se analyzer vier neutro (0.5), a leitura direcional domina.
+            if abs(base_score - 0.5) < 0.03:
+                return directional_score
+            return min(1.0, max(0.0, (0.35 * base_score) + (0.65 * directional_score)))
+        except Exception:
+            return min(1.0, max(0.0, base_score))
     
     def get_confluence_score(
         self,
@@ -105,9 +196,9 @@ class ConfluenceScoreSystem:
         
         # 1. Tradicional (indicadores)
         if signal_data:
-            scores['traditional'] = self.calculate_traditional_score(df, signal_data)
+            scores['traditional'] = self.calculate_traditional_score(df, direction, signal_data)
         else:
-            scores['traditional'] = 0.5  # neutro se não fornecido
+            scores['traditional'] = self.calculate_traditional_score(df, direction, None)
         
         # 2. SMC
         smc_score = self.smc.get_smc_score(df, direction)
@@ -125,16 +216,49 @@ class ConfluenceScoreSystem:
         elliott_score = self.elliott.get_elliott_score(df, direction)
         scores['elliott'] = elliott_score
         
-        # Calcular score final ponderado
-        final_score = 0.0
+        # Score bruto ponderado (0-1)
+        raw_score = 0.0
         for technique, weight in self.WEIGHTS.items():
-            final_score += scores[technique] * weight
-        
+            raw_score += scores[technique] * weight
+
+        raw_score = min(1.0, max(0.0, raw_score))
+
+        # Score normalizado por técnicas efetivamente ativas para reduzir
+        # falso "sempre neutro" quando detectores de padrão não disparam.
+        active_weight = sum(
+            weight
+            for technique, weight in self.WEIGHTS.items()
+            if scores.get(technique, 0.0) >= self.ACTIVE_TECHNIQUE_MIN_SCORE
+        )
+        # ----------------------------
+        # NORMALIZAÇÃO
+        # ----------------------------
+        normalized_score = raw_score / active_weight if active_weight > 0 else raw_score
+        normalized_score = min(1.0, max(0.0, normalized_score))
+
+        # ----------------------------
+        # PENALIZAÇÃO POR COBERTURA
+        # ----------------------------
+        coverage_ratio = active_weight  # total = 1.0
+
+        coverage_penalty = 0.55 + (0.45 * coverage_ratio)
+
+        # ----------------------------
+        # BLEND MAIS CONSERVADOR
+        # ----------------------------
+        blended_score = (
+            (0.5 * raw_score) +
+            (0.5 * normalized_score)
+        )
+
+        final_score = blended_score * coverage_penalty
         final_score = min(1.0, max(0.0, final_score))
-        final_score_pct = int(final_score * 100)
+
+        final_score_pct = int(round(final_score * 100))
+        raw_score_pct = int(round(raw_score * 100))
         
-        # Contar confluências (score > 0.4 = concorda)
-        agreement_threshold = 0.4
+        # Contar confluências (score >= limiar = concorda)
+        agreement_threshold = self.AGREEMENT_THRESHOLD
         factors_agree = []
         factors_disagree = []
         
@@ -156,6 +280,9 @@ class ConfluenceScoreSystem:
         return {
             'final_score': final_score,
             'final_score_pct': final_score_pct,
+            'raw_score': raw_score,
+            'raw_score_pct': raw_score_pct,
+            'normalized_score': normalized_score,
             'direction': direction,
             'scores': scores,
             'confluence_count': confluence_count,
@@ -177,24 +304,25 @@ class ConfluenceScoreSystem:
         Returns:
             String de recomendação
         """
-        # Critérios:
-        # STRONG: score >= 0.7 E confluência >= 4
-        # Normal: score >= 0.55 E confluência >= 3
-        # NEUTRAL: score < 0.55 OU confluência < 3
-        
-        if score >= 0.70 and confluence_count >= 4:
+        # Critérios padrão calibrados para curto prazo, configuráveis via env.
+        if score >= self.STRONG_MIN_SCORE and confluence_count >= self.STRONG_MIN_CONFLUENCE:
             return f'STRONG_{direction}'
-        elif score >= 0.55 and confluence_count >= 3:
+
+        if score >= self.MIN_SCORE and confluence_count >= self.MIN_CONFLUENCE:
             return direction
-        else:
-            return 'NEUTRAL'
+
+        # Nível fraco para leitura direcional com baixa convicção.
+        if score >= 0.40 and confluence_count >= 2:
+            return f'WEAK_{direction}'
+
+        return 'NEUTRAL'
     
     def should_enter_trade(
         self,
         df: pd.DataFrame,
         direction: str,
         signal_data: Optional[Dict] = None,
-        min_score: float = 0.55,
+        min_score: float = 0.58,
         min_confluence: int = 3
     ) -> Tuple[bool, Dict]:
         """
@@ -212,28 +340,44 @@ class ConfluenceScoreSystem:
         """
         analysis = self.get_confluence_score(df, direction, signal_data)
         
-        # Critérios:
-        # 1. Score final >= threshold
-        # 2. Confluência >= mínimo
-        # 3. SMC não deve ser ranging (bloqueio absoluto)
-        
-        # Verificar estrutura SMC
+        # 1) Bloquear sinais fracos
+        recommendation = analysis.get('recommendation', 'NEUTRAL')
+        if recommendation.startswith('WEAK'):
+            analysis['block_reason'] = 'Sinal fraco - baixa qualidade'
+            return False, analysis
+
+        if recommendation == 'NEUTRAL':
+            analysis['block_reason'] = 'Sem confluência'
+            return False, analysis
+
+        # 2) Filtro SMC
         smc_analysis = self.smc.get_analysis(df)
         if smc_analysis['structure'] == 'ranging':
-            analysis['block_reason'] = 'SMC: mercado lateralizado (ranging)'
+            analysis['block_reason'] = 'Mercado lateral (SMC)'
             return False, analysis
-        
-        # Verificar score
+
+        # 3) Filtro de volatilidade
+        try:
+            atr = float(df['atr'].iloc[-1])
+            price = float(df['close'].iloc[-1])
+            volatility = (atr / price) if price > 0 else 0.0
+
+            if volatility < 0.003:
+                analysis['block_reason'] = 'Baixa volatilidade'
+                return False, analysis
+        except Exception:
+            pass
+
+        # 4) Verificar score
         if analysis['final_score'] < min_score:
-            analysis['block_reason'] = f'Score insuficiente ({analysis["final_score"]:.2f} < {min_score})'
+            analysis['block_reason'] = f'Score baixo ({analysis["final_score"]:.2f})'
             return False, analysis
-        
-        # Verificar confluência
+
+        # 5) Verificar confluência
         if analysis['confluence_count'] < min_confluence:
-            analysis['block_reason'] = f'Poucas confirmações ({analysis["confluence_count"]} < {min_confluence})'
+            analysis['block_reason'] = f'Pouca confluência ({analysis["confluence_count"]})'
             return False, analysis
-        
-        # Passou em todos os critérios!
+
         analysis['block_reason'] = None
         return True, analysis
     

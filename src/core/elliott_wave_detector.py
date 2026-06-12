@@ -1,12 +1,17 @@
 """
-Elliott Wave Detector - Versão simplificada para trading de curto prazo
-Identifica: Impulse waves (5 ondas) e Corrective waves (3 ondas) de forma pragmática
-Autor: Sistema ATLAS - Fase 4
+Elliott Wave Detector v2 - INSTITUCIONAL
+ATLAS v2 — Advanced Technical Liquidity Analysis System
+
+Melhorias v2:
+  - wave_valid só True quando estrutura completa identificada
+  - Score neutro-baixo quando contagem inválida
+  - Impulse wave com validação de proporção das ondas
+  - Momentum como confirmador secundário
 """
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, List, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
@@ -14,306 +19,178 @@ logger = logging.getLogger(__name__)
 
 class ElliottWaveDetector:
     """
-    Detector simplificado de ondas Elliott focado em impulso vs correção
-    Não tenta identificar ondas exatas, mas detecta PADRÃO de movimento
+    Elliott Wave v2 — Confirmador de momentum.
+
+    Uso correto:
+      Elliott NÃO decide o trade.
+      Ele confirma se o momentum está em fase de impulso ou correção.
+
+    wave_valid = True apenas quando estrutura claramente identificada.
     """
-    
+
     def __init__(self, lookback_period: int = 100):
-        """
-        Args:
-            lookback_period: Número de candles para análise de ondas
-        """
-        self.lookback_period = lookback_period
-    
+        self.lookback = lookback_period
+
     def _find_swing_points(self, df: pd.DataFrame, window: int = 5) -> Tuple[List, List]:
-        """
-        Encontra swing highs e swing lows
-        
-        Returns:
-            (swing_highs, swing_lows) - listas de índices
-        """
-        highs = []
-        lows = []
-        
-        for i in range(window, len(df) - window):
-            # Swing high: maior que vizinhos
-            if df['high'].iloc[i] == df['high'].iloc[i-window:i+window+1].max():
-                highs.append(i)
-            
-            # Swing low: menor que vizinhos
-            if df['low'].iloc[i] == df['low'].iloc[i-window:i+window+1].min():
-                lows.append(i)
-        
+        data  = df.tail(self.lookback).reset_index(drop=True)
+        highs, lows = [], []
+        for i in range(window, len(data) - window):
+            if data['high'].iloc[i] == data['high'].iloc[i-window:i+window+1].max():
+                highs.append((i, float(data['high'].iloc[i])))
+            if data['low'].iloc[i] == data['low'].iloc[i-window:i+window+1].min():
+                lows.append((i, float(data['low'].iloc[i])))
         return highs, lows
-    
+
     def detect_impulse_wave(self, df: pd.DataFrame) -> Dict:
         """
-        Detecta onda de impulso (5 ondas na mesma direção geral)
-        
-        Returns:
-            {
-                'detected': bool,
-                'direction': 'bullish' | 'bearish' | None,
-                'wave_count': int,
-                'strength': 0.0-1.0
-            }
+        Onda de impulso (5 ondas):
+        W1 alta → W2 correção → W3 alta (maior) → W4 correção → W5 alta.
+        Retorna wave_valid=True apenas se estrutura clara.
         """
-        if len(df) < 50:
-            return {'detected': False, 'direction': None, 'wave_count': 0, 'strength': 0.0}
-        
-        recent = df.tail(self.lookback_period).copy().reset_index(drop=True)
-        
-        # Encontrar swings
-        swing_highs, swing_lows = self._find_swing_points(recent, window=3)
-        
-        # Analisar se há padrão impulsivo
-        # Impulso de alta: 3+ swing highs crescentes
-        # Impulso de baixa: 3+ swing lows decrescentes
-        
-        # Checar impulso de alta
-        if len(swing_highs) >= 3:
-            last_3_highs = swing_highs[-3:]
-            high_values = [recent['high'].iloc[i] for i in last_3_highs]
-            
-            # Highs crescentes = impulso de alta
-            if high_values[0] < high_values[1] < high_values[2]:
-                # Força: velocidade da subida
-                price_change = (high_values[-1] - high_values[0]) / high_values[0]
-                strength = min(1.0, abs(price_change) * 10)
-                
-                return {
-                    'detected': True,
-                    'direction': 'bullish',
-                    'wave_count': len(swing_highs),
-                    'strength': strength
-                }
-        
-        # Checar impulso de baixa
-        if len(swing_lows) >= 3:
-            last_3_lows = swing_lows[-3:]
-            low_values = [recent['low'].iloc[i] for i in last_3_lows]
-            
-            # Lows decrescentes = impulso de baixa
-            if low_values[0] > low_values[1] > low_values[2]:
-                price_change = (low_values[-1] - low_values[0]) / low_values[0]
-                strength = min(1.0, abs(price_change) * 10)
-                
-                return {
-                    'detected': True,
-                    'direction': 'bearish',
-                    'wave_count': len(swing_lows),
-                    'strength': strength
-                }
-        
-        return {'detected': False, 'direction': None, 'wave_count': 0, 'strength': 0.0}
-    
+        try:
+            highs, lows = self._find_swing_points(df)
+            if len(highs) < 3 or len(lows) < 2:
+                return {'detected': False, 'wave_valid': False, 'direction': 'unknown'}
+
+            # Pegar últimos swings
+            sh = sorted(highs[-4:], key=lambda x: x[0])
+            sl = sorted(lows[-3:],  key=lambda x: x[0])
+
+            if len(sh) < 3 or len(sl) < 2:
+                return {'detected': False, 'wave_valid': False, 'direction': 'unknown'}
+
+            # Validar sequência de alta: cada topo > anterior
+            tops_ascending = all(sh[i][1] < sh[i+1][1] for i in range(len(sh)-1))
+            # Fundos ascendentes
+            bots_ascending = all(sl[i][1] < sl[i+1][1] for i in range(len(sl)-1))
+
+            # Regra: W3 nunca pode ser a menor (comparar diferenças)
+            if tops_ascending and bots_ascending and len(sh) >= 3:
+                w1 = sh[1][1] - sl[0][1]
+                w3 = sh[2][1] - sl[1][1]
+                if w3 > w1:  # W3 > W1 (regra básica Elliott)
+                    return {'detected': True, 'wave_valid': True, 'direction': 'bullish',
+                            'current_wave': 3, 'confidence': 0.70}
+
+            # Impulso de baixa
+            tops_desc = all(sh[i][1] > sh[i+1][1] for i in range(len(sh)-1))
+            bots_desc = all(sl[i][1] > sl[i+1][1] for i in range(len(sl)-1))
+            if tops_desc and bots_desc and len(sl) >= 3:
+                w1 = sl[0][1] - sh[1][1]
+                w3 = sl[1][1] - sh[2][1]
+                if w3 > w1:
+                    return {'detected': True, 'wave_valid': True, 'direction': 'bearish',
+                            'current_wave': 3, 'confidence': 0.70}
+
+            return {'detected': False, 'wave_valid': False, 'direction': 'unknown'}
+        except Exception as e:
+            logger.debug(f"Erro impulse: {e}")
+            return {'detected': False, 'wave_valid': False, 'direction': 'unknown'}
+
     def detect_corrective_wave(self, df: pd.DataFrame) -> Dict:
         """
-        Detecta onda corretiva (ABC - movimento contra tendência anterior)
-        
-        Returns:
-            {
-                'detected': bool,
-                'correction_depth': float (0.0-1.0),
-                'direction': 'up' | 'down' | None,
-                'likely_finished': bool
-            }
+        Onda corretiva (ABC):
+        Detecta quando mercado está em correção (melhor aguardar).
         """
-        if len(df) < 30:
-            return {'detected': False, 'correction_depth': 0.0, 'direction': None, 'likely_finished': False}
-        
-        recent = df.tail(50).copy().reset_index(drop=True)
-        
-        # Identificar tendência anterior
-        first_third = recent.iloc[:16]
-        last_third = recent.iloc[-16:]
-        
-        trend_start = first_third['close'].mean()
-        trend_end = last_third['close'].mean()
-        
-        # Se lateral, sem correção clara
-        if abs(trend_end - trend_start) / trend_start < 0.02:
-            return {'detected': False, 'correction_depth': 0.0, 'direction': None, 'likely_finished': False}
-        
-        # Detectar pico (para correção de baixa) ou fundo (para correção de alta)
-        peak_price = recent['high'].max()
-        peak_idx = recent['high'].idxmax()
-        trough_price = recent['low'].min()
-        trough_idx = recent['low'].idxmin()
-        
-        current_price = recent['close'].iloc[-1]
-        
-        # Correção de baixa (após alta)
-        if peak_idx < len(recent) - 5:  # Pico não é agora
-            correction = (peak_price - current_price) / peak_price
-            if 0.2 < correction < 0.7:  # Correção típica 20-70%
-                # Fibonacci: 38.2%, 50%, 61.8%
-                fib_levels = [0.382, 0.5, 0.618]
-                at_fib = any(abs(correction - fib) < 0.05 for fib in fib_levels)
-                
-                return {
-                    'detected': True,
-                    'correction_depth': correction,
-                    'direction': 'down',
-                    'likely_finished': at_fib
-                }
-        
-        # Correção de alta (após baixa)
-        if trough_idx < len(recent) - 5:  # Fundo não é agora
-            correction = (current_price - trough_price) / trough_price
-            if 0.2 < correction < 0.7:
-                fib_levels = [0.382, 0.5, 0.618]
-                at_fib = any(abs(correction - fib) < 0.05 for fib in fib_levels)
-                
-                return {
-                    'detected': True,
-                    'correction_depth': correction,
-                    'direction': 'up',
-                    'likely_finished': at_fib
-                }
-        
-        return {'detected': False, 'correction_depth': 0.0, 'direction': None, 'likely_finished': False}
-    
+        try:
+            highs, lows = self._find_swing_points(df)
+            if len(highs) < 2 or len(lows) < 2:
+                return {'detected': False, 'wave_valid': False}
+
+            sh = sorted(highs[-3:], key=lambda x: x[0])
+            sl = sorted(lows[-3:],  key=lambda x: x[0])
+
+            if len(sh) < 2 or len(sl) < 2:
+                return {'detected': False, 'wave_valid': False}
+
+            # ABC bullish: queda, subida, queda (pullback normal)
+            tops_desc = sh[-1][1] < sh[-2][1]
+            bots_asc  = sl[-1][1] > sl[-2][1] if len(sl) >= 2 else False
+
+            if tops_desc and bots_asc:
+                return {'detected': True, 'wave_valid': True, 'type': 'ABC_bullish_correction'}
+
+            tops_asc = sh[-1][1] > sh[-2][1]
+            bots_desc = sl[-1][1] < sl[-2][1] if len(sl) >= 2 else False
+
+            if tops_asc and bots_desc:
+                return {'detected': True, 'wave_valid': True, 'type': 'ABC_bearish_correction'}
+
+            return {'detected': False, 'wave_valid': False}
+        except Exception as e:
+            return {'detected': False, 'wave_valid': False}
+
     def get_wave_momentum(self, df: pd.DataFrame) -> str:
-        """
-        Determina momento da onda: impulse vs correction
-        
-        Returns:
-            'impulsive_up' | 'impulsive_down' | 'corrective' | 'neutral'
-        """
-        impulse = self.detect_impulse_wave(df)
-        correction = self.detect_corrective_wave(df)
-        
-        # Priorizar impulso (mais forte)
-        if impulse['detected']:
-            if impulse['direction'] == 'bullish':
-                return 'impulsive_up'
-            else:
-                return 'impulsive_down'
-        
-        # Depois correção
-        if correction['detected']:
-            return 'corrective'
-        
-        return 'neutral'
-    
+        """Retorna momentum atual: impulse_up | impulse_down | corrective | unknown."""
+        try:
+            impulse = self.detect_impulse_wave(df)
+            if impulse['wave_valid']:
+                return f"impulse_{impulse['direction']}"
+            corrective = self.detect_corrective_wave(df)
+            if corrective['wave_valid']:
+                return 'corrective'
+            return 'unknown'
+        except Exception:
+            return 'unknown'
+
+    # ──────────────────────────────────────────────────────────────────
+    # ELLIOTT SCORE v2
+    # ──────────────────────────────────────────────────────────────────
     def get_elliott_score(self, df: pd.DataFrame, direction: str) -> float:
         """
-        Calcula score Elliott para direção
-        
-        Args:
-            df: DataFrame OHLCV
-            direction: 'BUY' ou 'SELL'
-        
-        Returns:
-            Score 0.0-1.0
+        Score Elliott v2.
+        Se contagem inválida → máximo 0.40 (não contamina confluência).
         """
-        impulse = self.detect_impulse_wave(df)
-        correction = self.detect_corrective_wave(df)
-        momentum = self.get_wave_momentum(df)
-        
-        score = 0.0
-        
-        if direction == 'BUY':
-            # Impulso de alta em andamento
-            if momentum == 'impulsive_up':
-                score += 0.5 * impulse['strength']
-            
-            # Correção de alta terminando (potencial reversão para cima)
-            if correction['detected'] and correction['direction'] == 'up' and correction['likely_finished']:
-                score += 0.4
-            
-            # Evitar comprar em impulso de baixa
-            if momentum == 'impulsive_down':
-                score = 0.0
-        
-        elif direction == 'SELL':
-            # Impulso de baixa em andamento
-            if momentum == 'impulsive_down':
-                score += 0.5 * impulse['strength']
-            
-            # Correção de baixa terminando (potencial reversão para baixo)
-            if correction['detected'] and correction['direction'] == 'down' and correction['likely_finished']:
-                score += 0.4
-            
-            # Evitar vender em impulso de alta
-            if momentum == 'impulsive_up':
-                score = 0.0
-        
-        return min(1.0, score)
-    
+        try:
+            impulse    = self.detect_impulse_wave(df)
+            corrective = self.detect_corrective_wave(df)
+            momentum   = self.get_wave_momentum(df)
+
+            # Sem contagem válida → neutro baixo
+            if not impulse['wave_valid'] and not corrective['wave_valid']:
+                return 0.35
+
+            score = 0.5
+
+            if direction == 'BUY':
+                if impulse['wave_valid'] and impulse['direction'] == 'bullish':
+                    score += 0.30 * impulse.get('confidence', 0.7)
+                elif impulse['wave_valid'] and impulse['direction'] == 'bearish':
+                    score -= 0.25
+                if corrective['wave_valid'] and 'bullish' in corrective.get('type', ''):
+                    score += 0.15  # fim de correção = entrada
+                if momentum == 'corrective':
+                    score -= 0.10  # aguardar fim da correção
+
+            else:  # SELL
+                if impulse['wave_valid'] and impulse['direction'] == 'bearish':
+                    score += 0.30 * impulse.get('confidence', 0.7)
+                elif impulse['wave_valid'] and impulse['direction'] == 'bullish':
+                    score -= 0.25
+                if corrective['wave_valid'] and 'bearish' in corrective.get('type', ''):
+                    score += 0.15
+                if momentum == 'corrective':
+                    score -= 0.10
+
+            return float(np.clip(score, 0.0, 1.0))
+
+        except Exception as e:
+            logger.error(f"Erro Elliott score: {e}")
+            return 0.35
+
     def get_analysis(self, df: pd.DataFrame) -> Dict:
-        """
-        Análise completa Elliott Wave
-        
-        Returns:
-            Dicionário com informações de ondas
-        """
-        impulse = self.detect_impulse_wave(df)
-        correction = self.detect_corrective_wave(df)
-        momentum = self.get_wave_momentum(df)
-        
-        return {
-            'impulse_wave': impulse,
-            'corrective_wave': correction,
-            'wave_momentum': momentum,
-            'score_buy': self.get_elliott_score(df, 'BUY'),
-            'score_sell': self.get_elliott_score(df, 'SELL')
-        }
-
-
-if __name__ == '__main__':
-    # Teste com dados sintéticos
-    print("═" * 60)
-    print("ELLIOTT WAVE DETECTOR TEST")
-    print("═" * 60)
-    
-    # Simular onda de impulso de alta (5 ondas)
-    np.random.seed(42)
-    dates = pd.date_range(start='2026-01-01', periods=150, freq='15m')
-    
-    # Criar movimento de 5 ondas
-    base = 100
-    wave_pattern = []
-    
-    for i in range(150):
-        # Onda 1: alta
-        if i < 30:
-            wave_pattern.append(base + i * 0.3)
-        # Onda 2: correção
-        elif i < 50:
-            wave_pattern.append(wave_pattern[29] - (i - 30) * 0.15)
-        # Onda 3: alta forte (maior)
-        elif i < 90:
-            wave_pattern.append(wave_pattern[49] + (i - 50) * 0.4)
-        # Onda 4: correção menor
-        elif i < 110:
-            wave_pattern.append(wave_pattern[89] - (i - 90) * 0.1)
-        # Onda 5: alta final
-        else:
-            wave_pattern.append(wave_pattern[109] + (i - 110) * 0.25)
-    
-    close = np.array(wave_pattern) + np.random.randn(150) * 0.5
-    high = close + np.abs(np.random.randn(150) * 0.3)
-    low = close - np.abs(np.random.randn(150) * 0.3)
-    open_price = close + np.random.randn(150) * 0.2
-    volume = np.random.randn(150) * 100 + 1000
-    
-    df = pd.DataFrame({
-        'timestamp': dates,
-        'open': open_price,
-        'high': high,
-        'low': low,
-        'close': close,
-        'volume': volume
-    })
-    
-    detector = ElliottWaveDetector(lookback_period=100)
-    analysis = detector.get_analysis(df)
-    
-    print(f"Impulse Wave: {analysis['impulse_wave']}")
-    print(f"Corrective Wave: {analysis['corrective_wave']}")
-    print(f"Wave Momentum: {analysis['wave_momentum']}")
-    print(f"\nScore BUY: {analysis['score_buy']:.2f}")
-    print(f"Score SELL: {analysis['score_sell']:.2f}")
-    print("═" * 60)
+        try:
+            impulse    = self.detect_impulse_wave(df)
+            corrective = self.detect_corrective_wave(df)
+            momentum   = self.get_wave_momentum(df)
+            return {
+                'impulse_detected':    impulse['detected'],
+                'wave_valid':           impulse['wave_valid'] or corrective['wave_valid'],
+                'impulse_direction':   impulse.get('direction', 'unknown'),
+                'corrective_detected': corrective['detected'],
+                'wave_momentum':        momentum,
+                'current_wave':         impulse.get('current_wave', None),
+            }
+        except Exception as e:
+            logger.error(f"Erro Elliott analysis: {e}")
+            return {'wave_valid': False, 'wave_momentum': 'unknown'}

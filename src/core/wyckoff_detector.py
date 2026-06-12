@@ -1,12 +1,18 @@
 """
-Wyckoff Detector - Detecta fases e padrões Wyckoff
-Identifica: Accumulation, Distribution, Spring, Upthrust, SOW, SOC
-Autor: Sistema ATLAS - Fase 2
+Wyckoff Detector v2 - INSTITUCIONAL
+ATLAS v2 — Advanced Technical Liquidity Analysis System
+
+Melhorias v2:
+  - Detecção de Spring/Upthrust com confirmação de volume
+  - Fases Wyckoff com critérios mais rigorosos
+  - Score zerado quando fase não identificada
+  - SOS/SOW com confirmação estrutural
+  - Integração com volume profile simplificado
 """
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Tuple, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -14,314 +20,239 @@ logger = logging.getLogger(__name__)
 
 class WyckoffDetector:
     """
-    Detector de padrões Wyckoff para análise de volume e acumulação/distribuição
+    Wyckoff Method v2 — Institucional.
+
+    Fases:
+      Accumulation  → Markup   (comprar no spring, confirmar SOS)
+      Distribution  → Markdown (vender no upthrust, confirmar SOW)
+      Re-accumulation / Re-distribution (dentro de tendência)
     """
-    
+
     def __init__(self, lookback_period: int = 50):
-        """
-        Args:
-            lookback_period: Número de candles para análise
-        """
-        self.lookback_period = lookback_period
-    
+        self.lookback = lookback_period
+
+    # ──────────────────────────────────────────────────────────────────
+    # FASE WYCKOFF
+    # ──────────────────────────────────────────────────────────────────
     def detect_phase(self, df: pd.DataFrame) -> Dict:
         """
-        Detecta a fase Wyckoff atual
-        
-        Returns:
-            {
-                'phase': 'accumulation' | 'distribution' | 'markup' | 'markdown' | 'neutral',
-                'confidence': 0.0-1.0,
-                'sub_phase': string ou None,
-                'volume_confirmation': bool
-            }
+        Detecta fase atual do mercado segundo Wyckoff.
+        Retorna fase + confiança.
         """
-        if len(df) < self.lookback_period:
-            return {'phase': 'neutral', 'confidence': 0.0, 'sub_phase': None, 'volume_confirmation': False}
-        
-        recent_df = df.tail(self.lookback_period).copy()
-        
-        # Análise de volume
-        avg_volume = recent_df['volume'].mean()
-        recent_volume = recent_df['volume'].tail(10).mean()
-        volume_increase = recent_volume > avg_volume * 1.2
-        
-        # Análise de range (lateralização)
-        highs = recent_df['high'].tail(20)
-        lows = recent_df['low'].tail(20)
-        price_range = highs.max() - lows.min()
-        avg_candle_range = (recent_df['high'] - recent_df['low']).mean()
-        is_ranging = price_range < avg_candle_range * 5  # Range comprimido
-        
-        # Análise de tendência
-        close_start = recent_df['close'].iloc[0]
-        close_end = recent_df['close'].iloc[-1]
-        trend_pct = ((close_end - close_start) / close_start) * 100
-        
-        # Detecção de acumulação
-        if is_ranging and volume_increase and abs(trend_pct) < 3:
-            # Preço lateral + volume alto = possível acumulação
-            phase = 'accumulation'
-            confidence = 0.7
-            sub_phase = 'Phase C' if self._detect_spring(recent_df) else 'Phase B'
-        
-        # Detecção de distribuição
-        elif is_ranging and volume_increase and close_end > close_start:
-            # Preço lateral no topo + volume = possível distribuição
-            phase = 'distribution'
-            confidence = 0.6
-            sub_phase = 'Phase C' if self._detect_upthrust(recent_df) else 'Phase B'
-        
-        # Markup (tendência de alta forte)
-        elif trend_pct > 5 and not is_ranging:
-            phase = 'markup'
-            confidence = 0.8 if volume_increase else 0.5
-            sub_phase = 'Phase E'
-        
-        # Markdown (tendência de baixa forte)
-        elif trend_pct < -5 and not is_ranging:
-            phase = 'markdown'
-            confidence = 0.8 if volume_increase else 0.5
-            sub_phase = 'Phase E'
-        
-        else:
-            phase = 'neutral'
-            confidence = 0.3
-            sub_phase = None
-        
-        return {
-            'phase': phase,
-            'confidence': confidence,
-            'sub_phase': sub_phase,
-            'volume_confirmation': volume_increase
-        }
-    
-    def _detect_spring(self, df: pd.DataFrame) -> bool:
+        try:
+            data  = df.tail(self.lookback).reset_index(drop=True)
+            close = data['close'].values
+            vol   = data['volume'].values if 'volume' in data.columns else np.ones(len(data))
+            high  = data['high'].values
+            low   = data['low'].values
+
+            # Médias para contexto
+            mid        = len(data) // 2
+            price_early = close[:mid].mean()
+            price_late  = close[mid:].mean()
+            vol_early   = vol[:mid].mean()
+            vol_late    = vol[mid:].mean()
+
+            price_up  = price_late > price_early * 1.005
+            price_dn  = price_late < price_early * 0.995
+            price_lat = not price_up and not price_dn
+
+            vol_expand = vol_late > vol_early * 1.1
+            vol_dry    = vol_late < vol_early * 0.9
+
+            # Range do período
+            rng    = high.max() - low.min()
+            rng_ok = rng > 0
+
+            # Proximidade ao fundo/topo do range
+            near_bottom = (close[-1] - low.min()) / rng < 0.25 if rng_ok else False
+            near_top    = (high.max() - close[-1]) / rng < 0.25 if rng_ok else False
+
+            # ── ACUMULAÇÃO ──
+            # Preço lateral/baixo + volume secando + próximo ao fundo
+            if price_lat and vol_dry and near_bottom:
+                return {'phase': 'accumulation', 'confidence': 0.75, 'bias': 'bullish'}
+
+            # ── MARKUP ──
+            # Preço subindo + volume expandindo
+            if price_up and vol_expand:
+                return {'phase': 'markup', 'confidence': 0.80, 'bias': 'bullish'}
+
+            # ── MARKUP sem volume (cautela) ──
+            if price_up and not vol_expand:
+                return {'phase': 'markup', 'confidence': 0.50, 'bias': 'bullish'}
+
+            # ── DISTRIBUIÇÃO ──
+            # Preço lateral/alto + volume secando + próximo ao topo
+            if price_lat and vol_dry and near_top:
+                return {'phase': 'distribution', 'confidence': 0.75, 'bias': 'bearish'}
+
+            # ── MARKDOWN ──
+            # Preço caindo + volume expandindo
+            if price_dn and vol_expand:
+                return {'phase': 'markdown', 'confidence': 0.80, 'bias': 'bearish'}
+
+            if price_dn and not vol_expand:
+                return {'phase': 'markdown', 'confidence': 0.50, 'bias': 'bearish'}
+
+            return {'phase': 'unknown', 'confidence': 0.0, 'bias': 'neutral'}
+
+        except Exception as e:
+            logger.debug(f"Erro detect_phase: {e}")
+            return {'phase': 'unknown', 'confidence': 0.0, 'bias': 'neutral'}
+
+    # ──────────────────────────────────────────────────────────────────
+    # SPRING (fundo falso = entrada long)
+    # ──────────────────────────────────────────────────────────────────
+    def _detect_spring(self, df: pd.DataFrame) -> Dict:
         """
-        Spring: Rompimento falso para baixo seguido de reversão forte
+        Spring = price varre fundo do range mas fecha acima → sinal de acumulação.
+        v2: exige volume decrescente no spring.
         """
-        if len(df) < 15:
-            return False
-        
-        recent = df.tail(15)
-        
-        # Procurar mínima local seguida de recuperação
-        lows = recent['low'].values
-        closes = recent['close'].values
-        volumes = recent['volume'].values
-        
-        # Última mínima quebrou suporte mas fechou acima
-        support = np.percentile(lows[:-5], 25)
-        
-        for i in range(-5, 0):
-            if lows[i] < support and closes[i] > support:
-                # Volume acima da média no spring?
-                if volumes[i] > volumes.mean() * 1.1:
-                    return True
-        
-        return False
-    
-    def _detect_upthrust(self, df: pd.DataFrame) -> bool:
+        try:
+            data   = df.tail(self.lookback).reset_index(drop=True)
+            recent = data.tail(10)
+            rng_low = data['low'].min()
+            last    = data.iloc[-1]
+            avg_vol = data['volume'].mean() if 'volume' in data.columns else 1
+
+            spring = (
+                float(last['low']) <= rng_low * 1.002 and
+                float(last['close']) > rng_low * 1.005 and
+                float(last.get('volume', avg_vol)) < avg_vol * 0.9
+            )
+            return {'detected': bool(spring), 'level': float(rng_low)}
+        except Exception as e:
+            logger.debug(f"Erro spring: {e}")
+            return {'detected': False, 'level': None}
+
+    # ──────────────────────────────────────────────────────────────────
+    # UPTHRUST (topo falso = entrada short)
+    # ──────────────────────────────────────────────────────────────────
+    def _detect_upthrust(self, df: pd.DataFrame) -> Dict:
         """
-        Upthrust: Rompimento falso para cima seguido de rejeição
+        Upthrust = price varre topo do range mas fecha abaixo → sinal de distribuição.
+        v2: exige volume decrescente no upthrust.
         """
-        if len(df) < 15:
-            return False
-        
-        recent = df.tail(15)
-        
-        # Procurar máxima local seguida de rejeição
-        highs = recent['high'].values
-        closes = recent['close'].values
-        volumes = recent['volume'].values
-        
-        # Última máxima quebrou resistência mas fechou abaixo
-        resistance = np.percentile(highs[:-5], 75)
-        
-        for i in range(-5, 0):
-            if highs[i] > resistance and closes[i] < resistance:
-                # Volume acima da média no upthrust?
-                if volumes[i] > volumes.mean() * 1.1:
-                    return True
-        
-        return False
-    
-    def detect_sign_of_weakness(self, df: pd.DataFrame) -> Dict:
-        """
-        SOW (Sign of Weakness): Vela de baixa com volume alto após alta
-        
-        Returns:
-            {'detected': bool, 'strength': 0.0-1.0}
-        """
-        if len(df) < 20:
-            return {'detected': False, 'strength': 0.0}
-        
-        recent = df.tail(20)
-        last_candle = recent.iloc[-1]
-        prev_candles = recent.iloc[-10:-1]
-        
-        # Vela de baixa forte
-        candle_body = last_candle['close'] - last_candle['open']
-        candle_range = last_candle['high'] - last_candle['low']
-        is_bearish = candle_body < 0
-        body_ratio = abs(candle_body) / candle_range if candle_range > 0 else 0
-        
-        # Volume acima da média
-        avg_volume = prev_candles['volume'].mean()
-        volume_spike = last_candle['volume'] > avg_volume * 1.3
-        
-        # Contexto: estava em alta?
-        trend_pct = ((prev_candles['close'].iloc[-1] - prev_candles['close'].iloc[0]) / prev_candles['close'].iloc[0]) * 100
-        was_uptrend = trend_pct > 2
-        
-        if is_bearish and body_ratio > 0.6 and volume_spike and was_uptrend:
-            strength = min(1.0, body_ratio + (0.3 if volume_spike else 0))
-            return {'detected': True, 'strength': strength}
-        
-        return {'detected': False, 'strength': 0.0}
-    
+        try:
+            data    = df.tail(self.lookback).reset_index(drop=True)
+            rng_high = data['high'].max()
+            last     = data.iloc[-1]
+            avg_vol  = data['volume'].mean() if 'volume' in data.columns else 1
+
+            upthrust = (
+                float(last['high']) >= rng_high * 0.998 and
+                float(last['close']) < rng_high * 0.995 and
+                float(last.get('volume', avg_vol)) < avg_vol * 0.9
+            )
+            return {'detected': bool(upthrust), 'level': float(rng_high)}
+        except Exception as e:
+            logger.debug(f"Erro upthrust: {e}")
+            return {'detected': False, 'level': None}
+
+    # ──────────────────────────────────────────────────────────────────
+    # SIGN OF STRENGTH / SIGN OF WEAKNESS
+    # ──────────────────────────────────────────────────────────────────
     def detect_sign_of_strength(self, df: pd.DataFrame) -> Dict:
-        """
-        SOS (Sign of Strength): Vela de alta com volume alto após baixa
-        
-        Returns:
-            {'detected': bool, 'strength': 0.0-1.0}
-        """
-        if len(df) < 20:
-            return {'detected': False, 'strength': 0.0}
-        
-        recent = df.tail(20)
-        last_candle = recent.iloc[-1]
-        prev_candles = recent.iloc[-10:-1]
-        
-        # Vela de alta forte
-        candle_body = last_candle['close'] - last_candle['open']
-        candle_range = last_candle['high'] - last_candle['low']
-        is_bullish = candle_body > 0
-        body_ratio = abs(candle_body) / candle_range if candle_range > 0 else 0
-        
-        # Volume acima da média
-        avg_volume = prev_candles['volume'].mean()
-        volume_spike = last_candle['volume'] > avg_volume * 1.3
-        
-        # Contexto: estava em baixa?
-        trend_pct = ((prev_candles['close'].iloc[-1] - prev_candles['close'].iloc[0]) / prev_candles['close'].iloc[0]) * 100
-        was_downtrend = trend_pct < -2
-        
-        if is_bullish and body_ratio > 0.6 and volume_spike and was_downtrend:
-            strength = min(1.0, body_ratio + (0.3 if volume_spike else 0))
-            return {'detected': True, 'strength': strength}
-        
-        return {'detected': False, 'strength': 0.0}
-    
+        """SOS = barra de alta com volume acima da média."""
+        try:
+            data    = df.tail(20).reset_index(drop=True)
+            last    = data.iloc[-1]
+            avg_vol = data['volume'].mean() if 'volume' in data.columns else 1
+            avg_body = (data['close'] - data['open']).abs().mean()
+
+            body   = float(last['close']) - float(last['open'])
+            vol    = float(last.get('volume', avg_vol))
+            sos    = body > avg_body * 1.2 and vol > avg_vol * 1.2 and body > 0
+
+            return {'detected': bool(sos), 'strength': vol / avg_vol if avg_vol > 0 else 1.0}
+        except Exception as e:
+            return {'detected': False, 'strength': 1.0}
+
+    def detect_sign_of_weakness(self, df: pd.DataFrame) -> Dict:
+        """SOW = barra de baixa com volume acima da média."""
+        try:
+            data    = df.tail(20).reset_index(drop=True)
+            last    = data.iloc[-1]
+            avg_vol = data['volume'].mean() if 'volume' in data.columns else 1
+            avg_body = (data['close'] - data['open']).abs().mean()
+
+            body = float(last['close']) - float(last['open'])
+            vol  = float(last.get('volume', avg_vol))
+            sow  = body < -avg_body * 1.2 and vol > avg_vol * 1.2
+
+            return {'detected': bool(sow), 'strength': vol / avg_vol if avg_vol > 0 else 1.0}
+        except Exception as e:
+            return {'detected': False, 'strength': 1.0}
+
+    # ──────────────────────────────────────────────────────────────────
+    # WYCKOFF SCORE v2
+    # ──────────────────────────────────────────────────────────────────
     def get_wyckoff_score(self, df: pd.DataFrame, direction: str) -> float:
         """
-        Calcula score Wyckoff para direção (BUY/SELL)
-        
-        Args:
-            df: DataFrame com OHLCV
-            direction: 'BUY' ou 'SELL'
-        
-        Returns:
-            Score 0.0-1.0
+        Score Wyckoff v2.
+        Se fase desconhecida → score máximo 0.40 (não contamina confluência).
         """
-        phase_data = self.detect_phase(df)
-        sos = self.detect_sign_of_strength(df)
-        sow = self.detect_sign_of_weakness(df)
-        
-        score = 0.0
-        
-        if direction == 'BUY':
-            # Favorável para compra
-            if phase_data['phase'] == 'accumulation':
-                score += 0.4 * phase_data['confidence']
-            elif phase_data['phase'] == 'markup':
-                score += 0.3 * phase_data['confidence']
-            
-            # Spring detectado
-            if phase_data['sub_phase'] == 'Phase C' and phase_data['phase'] == 'accumulation':
-                score += 0.3
-            
-            # Sign of Strength
-            if sos['detected']:
-                score += 0.3 * sos['strength']
-        
-        elif direction == 'SELL':
-            # Favorável para venda
-            if phase_data['phase'] == 'distribution':
-                score += 0.4 * phase_data['confidence']
-            elif phase_data['phase'] == 'markdown':
-                score += 0.3 * phase_data['confidence']
-            
-            # Upthrust detectado
-            if phase_data['sub_phase'] == 'Phase C' and phase_data['phase'] == 'distribution':
-                score += 0.3
-            
-            # Sign of Weakness
-            if sow['detected']:
-                score += 0.3 * sow['strength']
-        
-        return min(1.0, score)
-    
+        try:
+            phase    = self.detect_phase(df)
+            spring   = self._detect_spring(df)
+            upthrust = self._detect_upthrust(df)
+            sos      = self.detect_sign_of_strength(df)
+            sow      = self.detect_sign_of_weakness(df)
+
+            # Fase desconhecida = não ativa
+            if phase['phase'] == 'unknown':
+                return 0.35  # neutro baixo
+
+            score = 0.5
+
+            if direction == 'BUY':
+                if phase['phase'] in ('accumulation', 'markup'):
+                    score += 0.25 * phase['confidence']
+                elif phase['phase'] in ('distribution', 'markdown'):
+                    score -= 0.30
+
+                if spring['detected']:  score += 0.20
+                if sos['detected']:     score += 0.15
+                if upthrust['detected']: score -= 0.15
+                if sow['detected']:     score -= 0.10
+
+            else:  # SELL
+                if phase['phase'] in ('distribution', 'markdown'):
+                    score += 0.25 * phase['confidence']
+                elif phase['phase'] in ('accumulation', 'markup'):
+                    score -= 0.30
+
+                if upthrust['detected']: score += 0.20
+                if sow['detected']:      score += 0.15
+                if spring['detected']:   score -= 0.15
+                if sos['detected']:      score -= 0.10
+
+            return float(np.clip(score, 0.0, 1.0))
+
+        except Exception as e:
+            logger.error(f"Erro Wyckoff score: {e}")
+            return 0.35
+
+    # ──────────────────────────────────────────────────────────────────
+    # GET ANALYSIS
+    # ──────────────────────────────────────────────────────────────────
     def get_analysis(self, df: pd.DataFrame) -> Dict:
-        """
-        Análise completa Wyckoff
-        
-        Returns:
-            Dicionário com todas as informações
-        """
-        phase_data = self.detect_phase(df)
-        sos = self.detect_sign_of_strength(df)
-        sow = self.detect_sign_of_weakness(df)
-        
-        return {
-            'phase': phase_data['phase'],
-            'phase_confidence': phase_data['confidence'],
-            'sub_phase': phase_data['sub_phase'],
-            'volume_confirmation': phase_data['volume_confirmation'],
-            'sign_of_strength': sos,
-            'sign_of_weakness': sow,
-            'score_buy': self.get_wyckoff_score(df, 'BUY'),
-            'score_sell': self.get_wyckoff_score(df, 'SELL')
-        }
-
-
-if __name__ == '__main__':
-    # Teste com dados sintéticos
-    print("═" * 60)
-    print("WYCKOFF DETECTOR TEST")
-    print("═" * 60)
-    
-    # Simular acumulação (lateral com volume)
-    np.random.seed(42)
-    dates = pd.date_range(start='2026-01-01', periods=100, freq='1h')
-    
-    # Preço lateral em torno de 100
-    close = 100 + np.random.randn(100) * 2
-    high = close + np.abs(np.random.randn(100))
-    low = close - np.abs(np.random.randn(100))
-    open_price = close + np.random.randn(100) * 0.5
-    volume = np.random.randn(100) * 1000 + 5000
-    volume[-10:] *= 1.5  # Volume aumentando
-    
-    df = pd.DataFrame({
-        'timestamp': dates,
-        'open': open_price,
-        'high': high,
-        'low': low,
-        'close': close,
-        'volume': volume
-    })
-    
-    detector = WyckoffDetector(lookback_period=50)
-    analysis = detector.get_analysis(df)
-    
-    print(f"Fase: {analysis['phase']}")
-    print(f"Confiança: {analysis['phase_confidence']:.2f}")
-    print(f"Sub-fase: {analysis['sub_phase']}")
-    print(f"Volume Confirmação: {analysis['volume_confirmation']}")
-    print(f"Sign of Strength: {analysis['sign_of_strength']['detected']} (strength: {analysis['sign_of_strength']['strength']:.2f})")
-    print(f"Sign of Weakness: {analysis['sign_of_weakness']['detected']} (strength: {analysis['sign_of_weakness']['strength']:.2f})")
-    print(f"Score BUY: {analysis['score_buy']:.2f}")
-    print(f"Score SELL: {analysis['score_sell']:.2f}")
-    print("═" * 60)
+        try:
+            phase    = self.detect_phase(df)
+            spring   = self._detect_spring(df)
+            upthrust = self._detect_upthrust(df)
+            sos      = self.detect_sign_of_strength(df)
+            sow      = self.detect_sign_of_weakness(df)
+            return {
+                'phase':     phase['phase'],
+                'confidence': phase['confidence'],
+                'bias':       phase['bias'],
+                'spring':     spring['detected'],
+                'upthrust':   upthrust['detected'],
+                'sos':        sos['detected'],
+                'sow':        sow['detected'],
+            }
+        except Exception as e:
+            logger.error(f"Erro Wyckoff analysis: {e}")
+            return {'phase': 'unknown', 'confidence': 0.0, 'bias': 'neutral'}

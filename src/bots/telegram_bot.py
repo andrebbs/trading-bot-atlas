@@ -327,6 +327,36 @@ MONITOR_INDICATORS_CONFIG = {
 
 CURRENT_MARKET_TYPE = normalize_market_type(getattr(config, 'MARKET_TYPE', 'crypto_binary'))
 
+
+def _default_operation_market_mode() -> str:
+    """Resolve modo de mercado padrao a partir do roteamento atual."""
+    if CURRENT_MARKET_TYPE == 'forex':
+        return 'forex'
+    return 'crypto'
+
+
+_saved_market_mode = str(_load_bot_state().get('operation_market_mode') or '').strip().lower()
+_env_market_mode = str(os.getenv('OPERATION_MARKET_MODE', '') or '').strip().lower()
+OPERATION_MARKET_MODE = _saved_market_mode or _env_market_mode or _default_operation_market_mode()
+if OPERATION_MARKET_MODE not in {'crypto', 'forex'}:
+    OPERATION_MARKET_MODE = _default_operation_market_mode()
+
+
+def get_operation_market_mode() -> str:
+    """Retorna o modo operacional de mercado ativo (crypto|forex)."""
+    return OPERATION_MARKET_MODE
+
+
+def set_operation_market_mode(new_mode: str) -> bool:
+    """Atualiza e persiste o modo operacional de mercado."""
+    global OPERATION_MARKET_MODE
+    mode = (new_mode or '').strip().lower()
+    if mode not in {'crypto', 'forex'}:
+        return False
+    OPERATION_MARKET_MODE = mode
+    _save_bot_state('operation_market_mode', mode)
+    return True
+
 log_market_diagnostic(
     'bot_bootstrap',
     profile=BOT_PROFILE,
@@ -707,6 +737,9 @@ def get_operation_mode_snapshot(reference_time: datetime | None = None) -> dict:
     weekend_mode = is_weekend_binary_mode(current)
     dynamic_pool = get_active_dynamic_timeframes(current)
 
+    market_mode = get_operation_market_mode()
+    market_mode_label = 'Crypto' if market_mode == 'crypto' else 'Forex'
+
     if weekend_mode:
         return {
             'mode': 'weekend',
@@ -714,6 +747,8 @@ def get_operation_mode_snapshot(reference_time: datetime | None = None) -> dict:
             'summary': 'Range, rejeição e falsa quebra nos extremos.',
             'timeframes': dynamic_pool if monitor_timeframe_mode == 'dynamic' else [config.TIMEFRAME],
             'expires': '2 a 3 velas',
+            'market_mode': market_mode,
+            'market_mode_label': market_mode_label,
         }
 
     return {
@@ -722,6 +757,8 @@ def get_operation_mode_snapshot(reference_time: datetime | None = None) -> dict:
         'summary': 'Operacional padrão com filtros de tendência e continuidade.',
         'timeframes': dynamic_pool if monitor_timeframe_mode == 'dynamic' else [config.TIMEFRAME],
         'expires': '1 vela',
+        'market_mode': market_mode,
+        'market_mode_label': market_mode_label,
     }
 
 
@@ -1878,6 +1915,8 @@ async def notify_auto_monitor_started(context: ContextTypes.DEFAULT_TYPE):
 
     assets_crypto = [a for a in TV_TICKER_MAP if a.upper() not in EXTERNAL_FOREX]
     assets_forex  = [a for a in TV_TICKER_MAP if a.upper() in EXTERNAL_FOREX]
+    market_mode = get_operation_market_mode()
+    mode_label = 'Crypto' if market_mode == 'crypto' else 'Forex'
     forex_session_ok, forex_label = _is_forex_session_active()
     forex_status = f'✅ {forex_label}' if forex_session_ok else f'🔒 Fora de sessão ({forex_label})'
     interval_min = _SCAN_SIGNAL_INTERVAL // 60
@@ -1888,8 +1927,8 @@ async def notify_auto_monitor_started(context: ContextTypes.DEFAULT_TYPE):
             "🤖 *abbsCrypto iniciado*\n\n"
             "📡 *Scanner automático ATIVO*\n"
             f"🔬 Engine: TradingView API — 5m + 15m\n"
-            f"📊 9 critérios: EMA9/20, RSI, S/R, Dow, Fibo, Day range, ADX, PA\n"
-            f"🚦 FORTE ≥ 6/9 | ADX gate: crypto ≥ 20 | forex ≥ 25\n"
+            f"🧭 Modo operacional: *{mode_label}*\n"
+            f"🚦 Filtro de qualidade: sinais fortes + confirmação de contexto\n"
             f"🔄 Pré-análise P1: 4 min após cada entrada\n\n"
             f"💹 Crypto: {len(assets_crypto)} ativos — sempre ativo\n"
             f"💱 Forex: {len(assets_forex)} ativos — {forex_status}\n\n"
@@ -2042,50 +2081,50 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=None, timeframe=None):
-    """Análise avulsa usando engine TradingView (9 critérios profissionais)."""
-    import math as _math
-
+    """Análise avulsa usando sistema ATLAS (5 técnicas com confluência)."""
     current_symbol = (symbol or config.SYMBOL).upper()
     current_timeframe = _resolve_analysis_timeframe(timeframe)
     config.TIMEFRAME = current_timeframe
-    confirm_timeframe = get_higher_timeframe(current_timeframe)
 
-    # Normaliza para chave do TV_TICKER_MAP
-    # Ex: "BTC/USDT" → "BTC", "ETH/USDT" → "ETH", "US500" → "US500"
-    tv_key = current_symbol.split('/')[0]
+    await update.message.reply_text("🔥 Analisando com ATLAS... ⏳")
 
-    await update.message.reply_text("📊 Analisando via TradingView... ⏳")
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # VALIDAÇÃO DE LIQUIDEZ E TIPO DE ATIVO (ATLAS v1.1 - Jun 2026)
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # Verifica tipo primeiro com símbolo completo (ex: GBP/JPY)
+    av_type = 'forex' if current_symbol in EXTERNAL_FOREX else 'crypto'
+    market_mode = get_operation_market_mode()
+    
+    # Extrai base apenas para crypto (ex: BTC/USDT → BTC)
+    symbol_base = current_symbol.split('/')[0] if av_type == 'crypto' else current_symbol
 
-    # Verifica se o ativo é suportado
-    if tv_key not in TV_TICKER_MAP:
+    if market_mode == 'crypto' and av_type == 'forex':
         await update.message.reply_text(
-            f"❌ `{current_symbol}` não está no mapa de ativos suportados.\n"
-            f"Use um dos ativos listados no /scan.",
-            parse_mode='Markdown',
+            f"⛔ O par `{current_symbol}` é *Forex* e o bot está em modo *Crypto*.\n"
+            "Use `/modo forex` para operar pares forex.",
+            parse_mode='Markdown'
         )
         return
 
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # VALIDAÇÃO DE TIER DE LIQUIDEZ (ATLAS v1.1 - Jun 2026)
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # Bloqueia análise de alts (ADA/DOGE/LTC) em horários de baixa liquidez.
-    # Evita sinais falsos causados por dojis em madrugada asiática e finais de semana.
-    # ═══════════════════════════════════════════════════════════════════════════════
-    av_type = 'forex' if tv_key.upper() in EXTERNAL_FOREX else 'crypto'
+    if market_mode == 'forex' and av_type == 'crypto':
+        await update.message.reply_text(
+            f"⛔ O ativo `{current_symbol}` é *Crypto* e o bot está em modo *Forex*.\n"
+            "Use `/modo crypto` para operar criptoativos.",
+            parse_mode='Markdown'
+        )
+        return
     
-    # Validação de liquidez para ativos cripto
     if av_type == 'crypto':
-        can_trade, liquidity_msg = _check_crypto_liquidity_session(tv_key)
-        profile = _get_crypto_signal_profile(tv_key)
+        can_trade, liquidity_msg = _check_crypto_liquidity_session(symbol_base)
+        profile = _get_crypto_signal_profile(symbol_base)
         
         if not can_trade:
             await update.message.reply_text(
                 f"⏸ **{current_symbol}** - Filtro de Liquidez Ativo\n\n"
                 f"{liquidity_msg}\n\n"
                 f"💡 **Por quê?**\n"
-                f"Ativos Tier {profile['tier']} ({profile['tier_name']}) geram muitos dojis e sinais falsos "
-                f"em horários de baixa liquidez. O sistema ATLAS bloqueia análise nestes períodos "
-                f"para proteger a qualidade dos sinais.\n\n"
+                f"Ativos Tier {profile['tier']} ({profile['tier_name']}) geram sinais falsos "
+                f"em horários de baixa liquidez. O sistema ATLAS bloqueia análise nestes períodos.\n\n"
                 f"🕐 **Quando operar {current_symbol}:**\n" +
                 (f"• Qualquer horário (liquidez 24/7)" if profile['tier'] == 1 else
                  f"• Segunda a Sexta, 07-16h UTC (Londres) ou 12-21h UTC (NY)" if profile['tier'] == 2 else
@@ -2093,141 +2132,124 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
                 parse_mode='Markdown',
             )
             return
+    
+    # Verifica sessão forex
+    if av_type == 'forex':
+        sess_ok, sess_label = _is_forex_session_active()
+        if not sess_ok:
+            await update.message.reply_text(
+                f"⏸ *{current_symbol}* é um par Forex.\n"
+                f"Sessão ativa: _{sess_label}_\n"
+                f"Sinais forex só são confiáveis nas sessões de Londres (08–16h UTC) ou NY (12–21h UTC).",
+                parse_mode='Markdown',
+            )
+            return
+    
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FOREX REQUER MT5 OU TRADINGVIEW (não disponível via BitGet)
+    # ═══════════════════════════════════════════════════════════════════════════════
+    if av_type == 'forex':
+        await update.message.reply_text(
+            f"🌍 **{current_symbol}** - Análise Forex\n\n"
+            f"⚠️ **Dados forex via exchange não disponíveis**\n"
+            f"Pares forex não estão listados na BitGet (exchange de crypto).\n\n"
+            f"📊 **Opções para análise forex:**\n"
+            f"• Use `/monitor on` para monitorar via TradingView Scanner\n"
+            f"• Configure MT5 para análise detalhada (ver /help)\n"
+            f"• Registre sinais externos via `/pocket_add {current_symbol} BUY 5m`\n\n"
+            f"💡 O sistema ATLAS para forex requer fonte de dados MT5 ou TradingView Premium.",
+            parse_mode='Markdown'
+        )
+        return
 
     try:
-        # Busca dados no timeframe configurado e no superior para confirmação
-        analysis_5m = _get_tv_analysis(tv_key, timeframe=current_timeframe)
-        if not analysis_5m:
-            await update.message.reply_text(f"❌ Sem dados TradingView para `{current_symbol}`.", parse_mode='Markdown')
+        # Instancia exchange connector (apenas para crypto)
+        exchange = ExchangeConnector(testnet=config.TESTNET)
+        
+        # Busca dados históricos do exchange
+        df = exchange.fetch_ohlcv(current_symbol, current_timeframe, limit=200)
+        if df is None or len(df) < 50:
+            await update.message.reply_text(
+                f"❌ Sem dados suficientes para `{current_symbol}` no timeframe {current_timeframe}.",
+                parse_mode='Markdown'
+            )
             return
-
-        analysis_15m = _get_tv_analysis(tv_key, timeframe=confirm_timeframe)
-
-        # Determina tipo do ativo para thresholds corretos
-        av_type = 'forex' if tv_key.upper() in EXTERNAL_FOREX else 'crypto'
-
-        # Verifica sessão forex
-        if av_type == 'forex':
-            sess_ok, sess_label = _is_forex_session_active()
-            if not sess_ok:
-                await update.message.reply_text(
-                    f"⏸ *{current_symbol}* é um par Forex.\n"
-                    f"Sessão ativa: _{sess_label}_\n"
-                    f"Sinais forex só são confiáveis na sessão de Londres (08–16h UTC) ou Nova York (12–21h UTC).",
-                    parse_mode='Markdown',
-                )
-                return
-
-        # Avalia BUY e SELL — escolhe o de maior pontuação
-        best_direction = None
-        best_score = -1
-        best_quality = ''
-        best_reasons = []
-        for direction in ('BUY', 'SELL'):
-            quality, reasons = _assess_signal_quality(analysis_5m, direction, asset_type=av_type)
-            score = sum(1 for r in reasons if r.startswith('✅'))
-            if score > best_score:
-                best_score = score
-                best_quality = quality
-                best_reasons = reasons
-                best_direction = direction
-
-        # Se ADX gate bloqueou ambas as direções (score=0), tenta sem gate p/ mostrar diagnóstico
-        if best_score == 0 and best_direction:
-            for direction in ('BUY', 'SELL'):
-                quality_ng, reasons_ng = _assess_signal_quality(
-                    analysis_5m, direction, asset_type=av_type, skip_adx_gate=True)
-                score_ng = sum(1 for r in reasons_ng if r.startswith('✅'))
-                if score_ng > best_score:
-                    best_score = score_ng
-                    best_quality = quality_ng
-                    best_reasons = reasons_ng
-                    best_direction = direction
-
-        # Confirmação 15m
-        mtf_confirmed = False
-        if analysis_15m and best_direction:
-            q15, _ = _assess_signal_quality(analysis_15m, best_direction, asset_type=av_type)
-            mtf_confirmed = 'FORTE' in q15 or 'MODERADO' in q15
-
-        close = analysis_5m.get('close')
-        rsi   = analysis_5m.get('RSI')
-        adx   = analysis_5m.get('ADX')
-        close_str = f'{close:.4g}' if close is not None else 'N/A'
-        rsi_str   = f'{rsi:.1f}'   if rsi   is not None else 'N/A'
-        adx_str   = f'{adx:.1f}'   if adx   is not None else 'N/A'
-        group = _external_asset_group(tv_key)
-
-        # Decide recomendação — 3 níveis para análise avulsa
-        dir_label = 'COMPRA' if best_direction == 'BUY' else 'VENDA'
-        safety_blocks = []
-        crypto_profile = _get_crypto_signal_profile(tv_key) if av_type == 'crypto' else None
-
-        if crypto_profile and best_direction:
-            if adx is None or adx < crypto_profile['min_adx']:
-                safety_blocks.append(
-                    f"ADX {adx_str} abaixo do minimo para {crypto_profile['tier']} ({crypto_profile['min_adx']:.0f})"
-                )
-            if rsi is not None:
-                if best_direction == 'BUY' and rsi >= crypto_profile['buy_rsi_block']:
-                    safety_blocks.append(
-                        f"RSI {rsi:.1f} esticado para compra (limite {crypto_profile['buy_rsi_block']:.0f})"
-                    )
-                if best_direction == 'SELL' and rsi <= crypto_profile['sell_rsi_block']:
-                    safety_blocks.append(
-                        f"RSI {rsi:.1f} esticado para venda (limite {crypto_profile['sell_rsi_block']:.0f})"
-                    )
-
-        # Gate de contra-tendência: Dow macro oposto → exige 5+/9 para MODERADO
-        dow_counter = any('contratendencia' in r or 'contra tendencia' in r for r in best_reasons)
-        moderado_min = 5 if dow_counter else 4
-
-        # LÓGICA CORRIGIDA: NEUTRO só quando ADX baixo (sem tendência clara)
-        # RSI extremo NÃO força NEUTRO, apenas ajusta direção/força
-        adx_too_low = False
-        rsi_reversal_signal = None
         
-        if crypto_profile:
-            # ADX abaixo do mínimo = mercado lateral, SIM é NEUTRO
-            if adx is None or adx < crypto_profile['min_adx']:
-                adx_too_low = True
-            
-            # RSI extremo sugere REVERSÃO, não neutralidade
-            if rsi is not None and best_direction:
-                if best_direction == 'BUY' and rsi >= 70:
-                    # Sobrecomprado: sinal de reversão para VENDA
-                    rsi_reversal_signal = 'SELL'
-                elif best_direction == 'SELL' and rsi <= 30:
-                    # Sobrevendido: sinal de reversão para COMPRA
-                    rsi_reversal_signal = 'BUY'
+        # Calcula indicadores
+        tech_indicators = TechnicalIndicators(df)
+        df = tech_indicators.calculate_all_indicators(MONITOR_INDICATORS_CONFIG)
         
-        # Aplicar reversão se RSI extremo
-        if rsi_reversal_signal:
-            best_direction = rsi_reversal_signal
-            dir_label = 'COMPRA' if rsi_reversal_signal == 'BUY' else 'VENDA'
-            # Reduzir score porque é contra-indicador
-            best_score = max(best_score - 2, 3)
+        # Extrai dados do último candle
+        last = df.iloc[-1]
+        close = float(last['close'])
+        rsi = float(last.get('rsi', 50))
+        adx = float(last.get('adx', 0))
+        stoch_k = float(last.get('stoch_k', 50) if pd.notna(last.get('stoch_k', 50)) else 50)
+        stoch_d = float(last.get('stoch_d', 50) if pd.notna(last.get('stoch_d', 50)) else 50)
+        ema9 = float(last.get('ema_9', last.get('ema9', close)) if pd.notna(last.get('ema_9', last.get('ema9', close))) else close)
         
-        # Decisão final
-        if adx_too_low or best_score < 3:
-            # NEUTRO só quando ADX baixo OU score muito fraco
-            rec_emoji, rec_label, rec_strength = '⚪', 'NEUTRO', ''
-        elif 'FORTE' in best_quality and best_score >= 6:
-            rec_emoji = '🟢' if best_direction == 'BUY' else '🔴'
-            rec_label = dir_label
-            rec_strength = 'FORTE'
-        elif best_score >= moderado_min:
-            rec_emoji = '🟡'
-            rec_label = dir_label
-            rec_strength = 'MODERADO'
+        # Prepara signal_data básico para ATLAS
+        signal_data = {
+            'score': 0.5,  # neutro inicial
+            'probability': 50.0,
+            'rsi': rsi,
+            'adx': adx,
+        }
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # SISTEMA ATLAS - Confluence Score
+        # ═══════════════════════════════════════════════════════════════════
+        buy_analysis = confluence_system.get_confluence_score(df, 'BUY', signal_data)
+        sell_analysis = confluence_system.get_confluence_score(df, 'SELL', signal_data)
+        
+        # Escolhe a melhor direção
+        if buy_analysis['final_score'] >= sell_analysis['final_score']:
+            analysis = buy_analysis
+            direction = 'BUY'
+            dir_emoji = '🟢'
+            dir_label = 'COMPRA'
         else:
-            rec_emoji, rec_label, rec_strength = '⚪', 'NEUTRO', ''
+            analysis = sell_analysis
+            direction = 'SELL'
+            dir_emoji = '🔴'
+            dir_label = 'VENDA'
+        
+        score_pct = analysis['final_score_pct']
+        raw_score_pct = analysis.get('raw_score_pct', score_pct)
+        confluence = analysis['confluence_count']
+        recommendation = analysis['recommendation']
 
-        # Próxima fronteira do timeframe configurado para entrada
-        tf_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440}
-        tf_min = tf_minutes.get(current_timeframe, 5)
+        # Classificação operacional de confluência (mais útil para decisão)
+        if confluence >= 4 and score_pct >= 60:
+            confluence_label = 'FORTE'
+            confluence_emoji = '🟢'
+        elif confluence >= 2 and score_pct >= 35:
+            confluence_label = 'MEDIA'
+            confluence_emoji = '🟡'
+        else:
+            confluence_label = 'FRACA'
+            confluence_emoji = '⚪'
+        
+        # Decisão final baseada no recommendation
+        if recommendation.startswith('STRONG_'):
+            strength = 'FORTE'
+            rec_emoji = dir_emoji
+        elif recommendation.startswith('WEAK_'):
+            strength = 'FRACO'
+            rec_emoji = '🟠'
+        elif recommendation == direction:
+            strength = 'MODERADO'
+            rec_emoji = '🟡'
+        else:
+            strength = ''
+            rec_emoji = '⚪'
+            dir_label = 'NEUTRO'
+        
+        # Próximo horário de entrada
         now_local = datetime.now()
+        tf_min = timeframe_to_minutes(current_timeframe)
         if tf_min < 60:
+            import math as _math
             total_min = now_local.minute + now_local.second / 60 + 0.02
             next_tf_min = _math.ceil(total_min / tf_min) * tf_min
             if next_tf_min >= 60:
@@ -2237,58 +2259,114 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
         else:
             entry_dt = now_local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=tf_min // 60)
         entry_str = entry_dt.strftime('%H:%M')
-        expiry_label = f'{tf_min} min' if tf_min < 60 else f'{tf_min // 60}h'
+        expiry_label = f'{tf_min}min' if tf_min < 60 else f'{tf_min // 60}h'
+        
+        # Formata breakdown das técnicas
+        scores = analysis['scores']
+        techniques = {
+            'smc': ('🎯 SMC', analysis['weights']['smc']),
+            'wyckoff': ('📊 Wyckoff', analysis['weights']['wyckoff']),
+            'price_action': ('🕯 Price Action', analysis['weights']['price_action']),
+            'traditional': ('📈 Tradicional', analysis['weights']['traditional']),
+            'elliott': ('🌊 Elliott Wave', analysis['weights']['elliott']),
+        }
+        
+        breakdown_lines = []
+        directional_lines = []
+        factors_pro = 0
+        factors_contra = 0
+        factors_neutral = 0
+        for key, (name, weight) in techniques.items():
+            individual_pct = int(scores[key] * 100)
+            contribution_pct = int(round(scores[key] * weight * 100))
+            agreed = '✅' if key in analysis['factors_agree'] else '⚠️'
 
-        mtf_tag = f'✅ {current_timeframe} + {confirm_timeframe} alinhados' if mtf_confirmed else f'⚠️ Apenas {current_timeframe} avaliado'
-        reasons_text = '\n'.join(f'  {r}' for r in best_reasons)
+            buy_val = float(buy_analysis['scores'].get(key, 0.0))
+            sell_val = float(sell_analysis['scores'].get(key, 0.0))
+            dominant = max(buy_val, sell_val)
+            diff = abs(buy_val - sell_val)
 
-        # Construir mensagem de ação
-        if rec_label == 'NEUTRO':
-            if adx_too_low:
-                action_line = (
-                    f"⚪ *RECOMENDAÇÃO: NEUTRO*\n"
-                    f"📊 ADX {adx_str} — mercado sem tendência clara (lateral).\n"
-                    f"⏸ Aguarde movimento direcional mais forte."
-                )
+            if dominant < 0.20 or diff < 0.08:
+                side = 'NEUTRO'
+                side_emoji = '⚪'
+                factors_neutral += 1
+            elif buy_val > sell_val:
+                side = 'COMPRA'
+                side_emoji = '🟢'
+                if direction == 'BUY':
+                    factors_pro += 1
+                else:
+                    factors_contra += 1
             else:
-                action_line = (
-                    f"⚪ *RECOMENDAÇÃO: NEUTRO*\n"
-                    f"⏸ Sinal fraco ({best_score}/9 critérios). Aguarde melhor configuração."
-                )
-            if safety_blocks:
-                action_line += '\n⚠️ Observações:\n' + '\n'.join(f'  • {item}' for item in safety_blocks)
-        elif rec_strength == 'FORTE':
-            action_line = (
-                f"{rec_emoji} *RECOMENDAÇÃO: {rec_label} — FORTE*\n"
-                f"❗️ Entrada sugerida: `{entry_str}` (UTC-3) | Expiração: {expiry_label}"
-            )
-            if rsi_reversal_signal:
-                action_line += f"\n🔄 Reversão esperada: RSI {rsi_str} extremo"
-        else:
-            action_line = (
-                f"{rec_emoji} *RECOMENDAÇÃO: {rec_label} — MODERADO*\n"
-                f"⚠️ Sinal presente mas não FORTE ({best_score}/9). Use com cautela.\n"
-                f"❗️ Entrada sugerida: `{entry_str}` (UTC-3) | Expiração: {expiry_label}"
-            )
-            if rsi_reversal_signal:
-                action_line += f"\n🔄 Reversão esperada: RSI {rsi_str} extremo"
+                side = 'VENDA'
+                side_emoji = '🔴'
+                if direction == 'SELL':
+                    factors_pro += 1
+                else:
+                    factors_contra += 1
 
+            breakdown_lines.append(
+                f"{agreed} {name} ({int(weight*100)}%): {individual_pct}% (contrib: {contribution_pct}pp)"
+            )
+            directional_lines.append(
+                f"{side_emoji} {name}: {side} (B:{int(round(buy_val * 100))}% | S:{int(round(sell_val * 100))}%)"
+            )
+        
+        breakdown_text = '\n'.join(breakdown_lines)
+        directional_text = '\n'.join(directional_lines)
+        
+        # Construir mensagem
         message = (
-            f"📊 *ANÁLISE — {current_symbol}* ({group})\n"
+            f"🔥 *ANÁLISE ATLAS — {current_symbol}*\n"
             f"📅 {now_local.strftime('%d/%m/%Y %H:%M:%S')}\n"
-            f"⏱ Timeframe: `{current_timeframe}` (confirmação: `{confirm_timeframe}`)\n"
-            f"💵 Preço: `{close_str}` | RSI: `{rsi_str}` | ADX: `{adx_str}`\n\n"
-            f"{action_line}\n"
-            f"_{mtf_tag}_\n\n"
-            f"📋 *Critérios ({best_score}/9):*\n"
-            f"{reasons_text}\n\n"
-            f"_Qualidade: {best_quality}_"
+            f"⏱ Timeframe: `{current_timeframe}`\n"
+            f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n"
+            f"📉 Stoch K/D: `{stoch_k:.1f}/{stoch_d:.1f}`\n\n"
+            f"{rec_emoji} *RECOMENDAÇÃO: {dir_label}" + (f" — {strength}*\n" if strength else "*\n") +
+            f"🎯 Score de Confluência: *{score_pct}%* (bruto: {raw_score_pct}%)\n"
+            f"🧪 Classificação ATLAS: *{recommendation}*\n"
+            f"✅ Consenso: *{confluence}/5 técnicas* concordam\n\n"
+            f"{confluence_emoji} *Confluência Operacional: {confluence_label}*\n"
+            f"✅ A favor: *{factors_pro}* | ❌ Contra: *{factors_contra}* | ⚪ Neutras: *{factors_neutral}*\n\n"
+            f"📊 *Breakdown por Técnica:*\n"
+            f"{breakdown_text}\n\n"
+            f"🧭 *Direção por Técnica:*\n"
+            f"{directional_text}\n\n"
+            f"ℹ️ Pesos (30%, 25%...) representam importância no modelo, não probabilidade de acerto.\n\n"
         )
+
+        # Viés tático para curto prazo (scalp) quando mercado está sem tendência clara.
+        tactical_lines = []
+        if adx < 15:
+            bullish_tactical = stoch_k > stoch_d and stoch_k < 35 and close >= ema9
+            bearish_tactical = stoch_k < stoch_d and stoch_k > 65 and close <= ema9
+            if bullish_tactical:
+                tactical_lines.append("🟢 *Viés tático (scalp):* compra de curto prazo possível")
+                tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para cima em região descontada")
+                tactical_lines.append("• Perfil: operação rápida e de maior risco")
+            elif bearish_tactical:
+                tactical_lines.append("🔴 *Viés tático (scalp):* venda de curto prazo possível")
+                tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para baixo em região esticada")
+                tactical_lines.append("• Perfil: operação rápida e de maior risco")
+        
+        if dir_label != 'NEUTRO' and not recommendation.startswith('WEAK_'):
+            message += f"❗️ Entrada sugerida: `{entry_str}` UTC-3 | Expiração: {expiry_label}\n"
+
+        if tactical_lines:
+            message += "\n" + "\n".join(tactical_lines) + "\n"
+        
+        if recommendation.startswith('WEAK_'):
+            message += "\n⚠️ *Atenção:* Sinal fraco (WEAK) — sem entrada recomendada"
+        elif score_pct < 55:
+            message += "\n⚠️ *Atenção:* Score baixo — aguarde configuração mais clara"
+        elif confluence < 3:
+            message += f"\n⚠️ *Atenção:* Apenas {confluence}/5 técnicas concordam — sinal fraco"
+        
         await update.message.reply_text(message, parse_mode='Markdown')
 
     except Exception as e:
-        logger.error(f"Erro na análise avulsa: {e}")
-        await update.message.reply_text(f"❌ Erro: {str(e)}")
+        logger.error(f"Erro na análise ATLAS: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Erro na análise: {str(e)}")
 
 
 async def analise_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2313,7 +2391,12 @@ async def analise_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         symbol = alias_map.get(raw_symbol)
         if symbol is None:
-            symbol = raw_symbol if '/' in raw_symbol else f'{raw_symbol}/USDT'
+            # Se é forex (com ou sem barra), usa direto
+            if raw_symbol in EXTERNAL_FOREX or raw_symbol.replace('/', '') in EXTERNAL_FOREX:
+                symbol = raw_symbol
+            # Senão, adiciona /USDT para crypto
+            else:
+                symbol = raw_symbol if '/' in raw_symbol else f'{raw_symbol}/USDT'
 
         if len(context.args) > 1:
             timeframe = (context.args[1] or '').strip().lower()
@@ -2424,16 +2507,35 @@ Para mudar use:
 
 
 async def modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /modo para mostrar o modo operacional atual."""
+    """Comando /modo para mostrar ou definir modo operacional (crypto|forex)."""
+    if context.args:
+        requested_mode = (context.args[0] or '').strip().lower()
+        if requested_mode in {'crypto', 'forex'}:
+            set_operation_market_mode(requested_mode)
+            mode_label = 'Crypto' if requested_mode == 'crypto' else 'Forex'
+            await _reply_text(
+                update,
+                (
+                    f"✅ Modo operacional alterado para *{mode_label}*.\n"
+                    "Use /monitor para validar os ativos e filtros da nova configuração."
+                ),
+                parse_mode='Markdown'
+            )
+            return
+        await _reply_text(update, "❌ Uso: /modo [crypto|forex]")
+        return
+
     mode_snapshot = get_operation_mode_snapshot()
     message = (
         "🧭 Modo Operacional Atual\n\n"
         f"• Mercado: {CURRENT_MARKET_TYPE}\n"
         f"• Perfil: {BOT_PROFILE}\n"
+        f"• Segmento: {mode_snapshot['market_mode_label']}\n"
         f"• Modo: {mode_snapshot['label']}\n"
         f"• Resumo: {mode_snapshot['summary']}\n"
         f"• Timeframes ativos: {', '.join(mode_snapshot['timeframes'])}\n"
-        f"• Expiração base: {mode_snapshot['expires']}"
+        f"• Expiração base: {mode_snapshot['expires']}\n\n"
+        "Alterar: /modo crypto ou /modo forex"
     )
     await _reply_text(update, message)
 
@@ -2636,20 +2738,28 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             remaining_exp = max(0, int(p['expiry_ts'] - time.time()))
             pending_info = f"\n📌 Sinal pendente: {p['asset']} {p['direction']} — expira em {remaining_exp}s"
 
-        assets_crypto = [a for a in TV_TICKER_MAP if a.upper() not in EXTERNAL_FOREX]
-        assets_forex  = [a for a in TV_TICKER_MAP if a.upper() in EXTERNAL_FOREX]
+        # Separa ativos por categoria real (não mistura crypto com ações/commodities)
+        crypto_tier1 = sorted(CRYPTO_TIER1_SYMBOLS)
+        crypto_tier2 = sorted(CRYPTO_TIER2_SYMBOLS)
+        crypto_tier3 = sorted(CRYPTO_TIER3_SYMBOLS)
+        total_crypto = len(crypto_tier1) + len(crypto_tier2) + len(crypto_tier3)
+        
+        assets_forex = [a for a in TV_TICKER_MAP if a.upper() in EXTERNAL_FOREX]
         forex_session_ok, forex_label = _is_forex_session_active()
         forex_status = f'✅ {forex_label}' if forex_session_ok else f'🔒 Bloqueado ({forex_label})'
 
         await _reply_text(
             update,
             f"📡 *Scanner automático: {status_icon}*{cooldown_info}{pending_info}\n\n"
-            f"🔬 *Engine:* TradingView API (5m + 15m)\n"
-            f"📊 *Critérios:* 9 pontos — EMA, RSI, Dow, Fibo, ADX, PA, S/R, Day range\n"
-            f"🚦 *FORTE:* ≥ 6/9 critérios em 5m, confirmado em 15m\n"
-            f"🛡 *ADX gate:* crypto ≥ 20 | forex ≥ 25\n\n"
-            f"💹 *Crypto ({len(assets_crypto)}):* {', '.join(assets_crypto)}\n"
-            f"💱 *Forex ({len(assets_forex)}):* {', '.join(assets_forex[:6])}...\n"
+            f"🔥 *Engine:* ATLAS — Sistema de Confluência (5 técnicas)\n"
+            f"📊 *Técnicas:* SMC (30%), Wyckoff (25%), Price Action (20%), Tradicional (15%), Elliott (10%)\n"
+            f"🎯 *Consenso:* ≥ 3/5 técnicas + Score ≥ 65%\n"
+            f"🛡 *Filtros:* Tier liquidez + ADX + Sessão ativa\n\n"
+            f"💹 *Crypto ({total_crypto} ativos com TIER):*\n"
+            f"  • TIER 1 (24/7): {', '.join(crypto_tier1)}\n"
+            f"  • TIER 2 (Sessão): {', '.join(crypto_tier2)}\n"
+            f"  • TIER 3 (Overlap): {', '.join(crypto_tier3)}\n\n"
+            f"💱 *Forex ({len(assets_forex)} pares):* {', '.join(assets_forex[:6])}...\n"
             f"🌐 *Sessão forex:* {forex_status}\n\n"
             f"⏱ *Varredura:* a cada 5 min | Cooldown: {_SCAN_SIGNAL_INTERVAL // 60} min entre sinais\n"
             f"🔄 *Pré-análise P1:* ativa (4 min após entrada)\n\n"
@@ -2660,21 +2770,34 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── LIGAR ─────────────────────────────────────────────────────────────
     if arg in ('on', 'ativar', 'ligar', '1'):
         _auto_scan_active = True
-        assets_crypto = [a for a in TV_TICKER_MAP if a.upper() not in EXTERNAL_FOREX]
-        assets_forex  = [a for a in TV_TICKER_MAP if a.upper() in EXTERNAL_FOREX]
+        
+        # Separa crypto real (com tier) de outros ativos
+        crypto_tier1 = sorted(CRYPTO_TIER1_SYMBOLS)
+        crypto_tier2 = sorted(CRYPTO_TIER2_SYMBOLS)
+        crypto_tier3 = sorted(CRYPTO_TIER3_SYMBOLS)
+        total_crypto = len(crypto_tier1) + len(crypto_tier2) + len(crypto_tier3)
+        
+        assets_forex = [a for a in TV_TICKER_MAP if a.upper() in EXTERNAL_FOREX]
         forex_session_ok, forex_label = _is_forex_session_active()
         forex_status = f'✅ {forex_label}' if forex_session_ok else f'🔒 Fora de sessão ({forex_label})'
         interval_min = _SCAN_SIGNAL_INTERVAL // 60
+        
         await _reply_text(
             update,
             "✅ *Scanner ATIVADO*\n\n"
-            f"🔬 Engine: TradingView — 5m + 15m confirmação\n"
-            f"📊 9 critérios: EMA9/20, RSI, S/R, Dow, Fibo, Day range, ADX, Price Action\n"
-            f"🚦 Sinal enviado apenas se FORTE (≥ 6/9) em 5m + confirmação 15m\n"
-            f"🛡 ADX gate: crypto ≥ 20 | forex ≥ 25\n"
-            f"🔄 Pré-análise P1: sim (4 min após entrada)\n\n"
-            f"💹 Crypto ({len(assets_crypto)} ativos) — sempre ativo\n"
-            f"💱 Forex ({len(assets_forex)} ativos) — {forex_status}\n\n"
+            f"🔥 *Engine:* ATLAS — Sistema de Confluência\n"
+            f"📊 *5 Técnicas:* SMC 30% | Wyckoff 25% | Price Action 20% | Tradicional 15% | Elliott 10%\n"
+            f"🎯 *Threshold:* ≥ 3/5 técnicas concordam + Score ≥ 65%\n"
+            f"🛡 *Filtros inteligentes:*\n"
+            f"  • TIER 1 (BTC/ETH): ADX ≥ 24, opera 24/7\n"
+            f"  • TIER 2 (SOL/XRP/BNB): ADX ≥ 26, sessão Londres/NY\n"
+            f"  • TIER 3 (Alts): ADX ≥ 30, apenas overlap Londres+NY\n"
+            f"🔄 *Pré-análise P1:* sim (4 min após entrada)\n\n"
+            f"💹 *Crypto ({total_crypto} ativos):*\n"
+            f"  🟢 TIER 1: {', '.join(crypto_tier1)}\n"
+            f"  🟡 TIER 2: {', '.join(crypto_tier2)}\n"
+            f"  🔴 TIER 3: {', '.join(crypto_tier3)}\n\n"
+            f"💱 *Forex ({len(assets_forex)} pares):* {forex_status}\n\n"
             f"⏱ Varredura: cada 5 min | Cooldown: {interval_min} min entre sinais\n\n"
             "_O bot avisará automaticamente quando encontrar sinal qualificado._"
         )
@@ -3042,29 +3165,36 @@ def _check_crypto_liquidity_session(asset: str) -> tuple[bool, str]:
 
 
 def _is_forex_session_active() -> tuple:
-    """Retorna (ativo: bool, label: str) indicando se há sessão forex líquida aberta.
-    Sessões consideradas (UTC):
-      Londres : 07:00 – 16:00
-      Nova York: 12:00 – 21:00
-    Overlap London+NY (12:00-16:00) = melhor momento.
-    Asiática (21:00 – 07:00) = evitar para binários de 5 min.
+    """Retorna (ativo: bool, label: str) indicando se há sessão forex aberta.
+    Forex opera 24h durante a semana, fecha apenas fim de semana.
+    Sessões (UTC):
+      Asiática (Sydney+Tóquio): 22:00 – 08:00 (menor liquidez)
+      Londres: 07:00 – 16:00 (boa liquidez)
+      Nova York: 12:00 – 21:00 (alta liquidez)
+      Overlap London+NY: 12:00 – 16:00 (melhor momento)
     """
     from datetime import timezone
     utc = datetime.now(timezone.utc)
-    # Forex spot fica fechado no fim de semana; evita alertas falsos em sábado/domingo.
+    # Forex spot fica fechado apenas no fim de semana
     if utc.weekday() >= 5:
         return False, f'Mercado fechado (fim de semana {utc.hour:02d}:{utc.minute:02d} UTC)'
 
     h = utc.hour + utc.minute / 60
     london   = 7.0 <= h < 16.0
     new_york = 12.0 <= h < 21.0
+    asian    = h >= 22.0 or h < 7.0  # 22:00-07:00 UTC
+    
     if london and new_york:
-        return True, 'London+NY overlap'
+        return True, 'London+NY overlap ⚡'
     if london:
         return True, 'Londres'
     if new_york:
         return True, 'Nova York'
-    return False, f'Sessão asiática/fechado ({utc.hour:02d}:{utc.minute:02d} UTC)'
+    if asian:
+        return True, 'Asiática (liquidez reduzida)'
+    
+    # Horários de transição (07:00-08:00, 16:00-22:00)
+    return True, f'Sessão aberta ({utc.hour:02d}:{utc.minute:02d} UTC)'
 
 
 _TV_INTERVAL_MAP = {
@@ -3813,6 +3943,7 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
     candidates = []
     # Sessão forex ativa? (bloqueia pares fora de London/NY)
     forex_session_ok, forex_session_label = _is_forex_session_active()
+    market_mode = get_operation_market_mode()
 
     seen_tv = set()
     rejection_stats = {
@@ -3831,6 +3962,13 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
 
         is_forex = asset.upper() in EXTERNAL_FOREX
         asset_type = 'forex' if is_forex else 'crypto'
+
+        # Filtro por modo operacional selecionado
+        if market_mode == 'crypto' and is_forex:
+            continue
+        if market_mode == 'forex' and not is_forex:
+            continue
+
         crypto_profile = _get_crypto_signal_profile(asset) if asset_type == 'crypto' else None
 
         # Bloqueia forex fora de sessão ativa
@@ -4067,8 +4205,28 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
                 exec_block = f"\n\n⚠️ _Execução falhou: {result.get('error', 'erro')}_"
 
     interval_min = _SCAN_SIGNAL_INTERVAL // 60
+    
+    # Formata análise técnica compacta
+    tech_lines = []
+    tech_lines.append(f"💰 Preço: `{close_str}`")
+    tech_lines.append(f"📊 RSI: `{rsi_str}` | ADX: `{analysis.get('ADX', 0):.0f}`")
+    
+    # Mostra EMAs principais
+    ema9 = analysis.get('EMA9')
+    ema20 = analysis.get('EMA20')
+    if ema9 and close:
+        ema9_pct = ((close - ema9) / ema9) * 100
+        ema9_emoji = '🟢' if ema9_pct > 0 else '🔴'
+        tech_lines.append(f"{ema9_emoji} EMA9: `{ema9:.4g}` ({ema9_pct:+.2f}%)")
+    if ema20 and close:
+        ema20_pct = ((close - ema20) / ema20) * 100
+        ema20_emoji = '🟢' if ema20_pct > 0 else '🔴'
+        tech_lines.append(f"{ema20_emoji} EMA20: `{ema20:.4g}` ({ema20_pct:+.2f}%)")
+    
+    tech_block = '\n'.join(tech_lines)
+    
     msg = (
-        f"{direction_arrow} *SINAL DETECTADO — {quality}*\n\n"
+        f"{direction_arrow} *SINAL DETECTADO — {quality}* 🎯\n\n"
         f"📊 *ATIVO:* {asset} ({group})\n"
         f"❗️ *ENTRADA:* `{entry_str}` (UTC-3)\n"
         f"⏰ *TEMPO:* 5 MINUTOS\n"
@@ -4076,9 +4234,8 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
         f"_{mtf_tag}_\n\n"
         f"🚦 *PROTEÇÕES (se necessário):*\n"
         f"  1ª: `{prot1_str}` | 2ª: `{prot2_str}`\n\n"
-        f"📋 *Análise ({score}/9 critérios):*\n"
-        f"Preco: `{close_str}` | RSI: `{rsi_str}`\n"
-        f"{reasons_text}"
+        f"📈 *Análise Técnica:*\n"
+        f"{tech_block}"
         f"{eco_block}"
         f"{exec_block}\n\n"
         f"_Resultado em ~5min | Próximo sinal em ~{interval_min}min após resultado_"

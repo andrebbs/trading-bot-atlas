@@ -1,0 +1,17 @@
+{
+  "symbol": "SOLUSDT",
+  "interval": "5m",
+  "capital_ini": 1000.0,
+  "capital_final": 1000.0,
+  "return_pct": 0.0,
+  "max_drawdown": 0.0,
+  "total_trades": 0,
+  "wins": 0,
+  "losses": 0,
+  "win_rate": 0,
+  "avg_win": 0,
+  "avg_loss": 0,
+  "profit_factor": Infinity,
+  "elapsed_sec": 0.0,
+  "generated_at": "2026-06-13T15:25:31.151810+00:00"
+}

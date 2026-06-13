@@ -4981,6 +4981,10 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                 probability = float(signal_data.get('probability', 0.0))
                 edge = abs(float(score) - 0.5)
                 consensus = _signal_quality_consensus(signal_data, signal)
+                atlas_score = float(signal_data.get('atlas_score', score))
+                atlas_score_pct = int(signal_data.get('atlas_score_pct', round(atlas_score * 100)))
+                atlas_recommendation = str(signal_data.get('recommendation', 'NEUTRAL'))
+                atlas_confluence = int(signal_data.get('confluence_count', consensus))
 
                 if weekend_mode:
                     consensus = max(consensus, 3 if signal != 0 else 0)
@@ -5146,6 +5150,8 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     primary_trend,
                     signal,
                 )
+                # O ATLAS já aprovou o sinal; usa o score final como desempate.
+                candidate_rank += atlas_score_pct * 0.25
                 if weekend_mode:
                     candidate_rank += 8.0
                 elif entry_decision['profile'] == 'entrada direta':
@@ -5209,9 +5215,12 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
 {entry_profile_line}
 🧠 Setup: {setup['setup_type']}
 🏗 Score estrutural: {setup['score']}/{max(8, min_setup_score + 1)}
-📊 Score: {score:.3f}
+📊 Score base: {score:.3f}
+📊 Score ATLAS: {atlas_score:.3f} ({atlas_score_pct}%)
 📈 Probabilidade: {probability:.1f}%
 ✅ Consenso de indicadores: {consensus}/4
+🧪 Classificação ATLAS: {atlas_recommendation}
+✅ Confluência ATLAS: {atlas_confluence}/5 técnicas
 
 🔎 Confirmações:
 • """ + "\n• ".join(setup['confirmations']) + f"""

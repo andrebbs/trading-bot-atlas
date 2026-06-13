@@ -350,11 +350,42 @@ class ConfluenceScoreSystem:
             analysis['block_reason'] = 'Sem confluência'
             return False, analysis
 
-        # 2) Filtro SMC
+        # 2) Filtro SMC estrutural — BOS/CHoCH + Sweep
         smc_analysis = self.smc.get_analysis(df)
-        if smc_analysis['structure'] == 'ranging':
+        if smc_analysis.get('structure') == 'ranging':
             analysis['block_reason'] = 'Mercado lateral (SMC)'
             return False, analysis
+
+        bos = smc_analysis.get('bos', {}) or {}
+        choch = smc_analysis.get('choch', {}) or {}
+        sweep = smc_analysis.get('liquidity_sweep', {}) or {}
+
+        if direction == 'BUY':
+            has_structure_break = bool(bos.get('bullish_bos') or choch.get('bullish_choch'))
+            has_directional_sweep = bool(sweep.get('swept_low'))
+        else:
+            has_structure_break = bool(bos.get('bearish_bos') or choch.get('bearish_choch'))
+            has_directional_sweep = bool(sweep.get('swept_high'))
+
+        # BOS/CHoCH vira gatilho obrigatório de estrutura. Sweep é forte, mas não obrigatório.
+        if not has_structure_break:
+            analysis['block_reason'] = f'Sem BOS/CHoCH válido para {direction}'
+            analysis['smc_gate'] = {
+                'has_structure_break': False,
+                'has_directional_sweep': has_directional_sweep,
+                'bos': bos,
+                'choch': choch,
+                'sweep': sweep,
+            }
+            return False, analysis
+
+        analysis['smc_gate'] = {
+            'has_structure_break': True,
+            'has_directional_sweep': has_directional_sweep,
+            'bos': bos,
+            'choch': choch,
+            'sweep': sweep,
+        }
 
         # 3) Filtro de volatilidade
         try:

@@ -145,6 +145,57 @@ class PriceActionDetector:
         except Exception:
             return {'detected': False, 'body_ratio': 0}
 
+
+    # ──────────────────────────────────────────────────────────────────
+    # THREE LINE STRIKE / THREE LINE MOMENTUM
+    # ──────────────────────────────────────────────────────────────────
+    def detect_three_line_momentum(self, df: pd.DataFrame, direction: str) -> Dict:
+        """
+        Detecta sequência de 3 candles alinhados com momentum.
+
+        BUY:
+          - 3 candles bullish consecutivos
+          - fechamentos ascendentes
+          - corpo relevante em relação ao range
+
+        SELL:
+          - 3 candles bearish consecutivos
+          - fechamentos descendentes
+          - corpo relevante em relação ao range
+        """
+        try:
+            if df is None or len(df) < 3:
+                return {'detected': False, 'direction': direction, 'strength': 0.0, 'reason': 'Histórico insuficiente'}
+
+            last3 = df.iloc[-3:]
+            metrics = [self._candle_metrics(row) for _, row in last3.iterrows()]
+            closes = list(last3['close'].astype(float))
+
+            avg_body_ratio = sum(m['body_ratio'] for m in metrics) / 3
+
+            if direction == 'BUY':
+                aligned = all(m['is_bull'] for m in metrics)
+                progressive = closes[0] < closes[1] < closes[2]
+            else:
+                aligned = all(not m['is_bull'] for m in metrics)
+                progressive = closes[0] > closes[1] > closes[2]
+
+            detected = aligned and progressive and avg_body_ratio >= 0.35
+            strength = min(1.0, avg_body_ratio + (0.25 if progressive else 0.0) + (0.20 if aligned else 0.0)) if detected else 0.0
+
+            return {
+                'detected': detected,
+                'direction': direction,
+                'strength': round(strength, 3),
+                'avg_body_ratio': round(avg_body_ratio, 3),
+                'aligned': aligned,
+                'progressive_closes': progressive,
+                'reason': 'Three-line momentum confirmado' if detected else 'Sem three-line momentum válido'
+            }
+        except Exception as e:
+            logger.error(f"Erro three-line momentum: {e}")
+            return {'detected': False, 'direction': direction, 'strength': 0.0, 'reason': str(e)}
+
     # ──────────────────────────────────────────────────────────────────
     # PRICE ACTION SCORE v2
     # ──────────────────────────────────────────────────────────────────
@@ -179,6 +230,10 @@ class PriceActionDetector:
                 if mom['detected']:
                     score += 0.20
 
+                three_line = self.detect_three_line_momentum(df, 'BUY')
+                if three_line['detected']:
+                    score += min(0.18, 0.10 + three_line['strength'] * 0.08)
+
                 # Continuidade: candle anterior também bullish
                 if len(df) >= 2:
                     prev = self._candle_metrics(df.iloc[-2])
@@ -202,6 +257,10 @@ class PriceActionDetector:
                     score += 0.25
                 if mom['detected']:
                     score += 0.20
+
+                three_line = self.detect_three_line_momentum(df, 'SELL')
+                if three_line['detected']:
+                    score += min(0.18, 0.10 + three_line['strength'] * 0.08)
 
                 if len(df) >= 2:
                     prev = self._candle_metrics(df.iloc[-2])

@@ -21,6 +21,7 @@ from src.core.smc_detector import SMCDetector
 from src.core.wyckoff_detector import WyckoffDetector
 from src.core.price_action_detector import PriceActionDetector
 from src.core.elliott_wave_detector import ElliottWaveDetector
+from src.core.transfer_detector import TransferDetector
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,7 @@ class ConfluenceScoreSystem:
         self.wyckoff = WyckoffDetector(lookback_period=50)
         self.price_action = PriceActionDetector(lookback_period=30)
         self.elliott = ElliottWaveDetector(lookback_period=100)
+        self.transfer = TransferDetector(lookback_period=30, sweep_window=10)
     
     def calculate_traditional_score(self, df: pd.DataFrame, direction: str, signal_data: Optional[Dict] = None) -> float:
         """
@@ -203,6 +205,13 @@ class ConfluenceScoreSystem:
         # 2. SMC
         smc_score = self.smc.get_smc_score(df, direction)
         scores['smc'] = smc_score
+
+        # 2b. Transfer (Liquidity Transfer / Displacement) - bonus pesado em SMC
+        transfer_score, transfer_info = self.transfer.get_transfer_score(df, direction)
+        # Soma bonus ponderado ate 25% sobre o score SMC (sem extrapolar 1.0)
+        if transfer_score > 0:
+            smc_enhanced = min(1.0, smc_score + (transfer_score * 0.25))
+            scores['smc'] = smc_enhanced
         
         # 3. Wyckoff
         wyckoff_score = self.wyckoff.get_wyckoff_score(df, direction)

@@ -267,8 +267,8 @@ if _saved_tf and _saved_tf in SUPPORTED_TIMEFRAMES:
 # Config do monitoramento automático
 # Verifica com maior frequência para conseguir alertar na janela 20s-10s antes da virada.
 MONITOR_INTERVAL_SECONDS = 5
-MONITOR_DURATION_MINUTES = _env_int('MONITOR_DURATION_MINUTES', 60, min_value=5)
-MONITOR_MAX_SIGNALS = _env_int('MONITOR_MAX_SIGNALS', 4)
+MONITOR_DURATION_MINUTES = _env_int('MONITOR_DURATION_MINUTES', 120, min_value=5)
+MONITOR_MAX_SIGNALS = _env_int('MONITOR_MAX_SIGNALS', 8)
 MONITOR_NEW_SIGNAL_CYCLE_MINUTES = _env_int('MONITOR_NEW_SIGNAL_CYCLE_MINUTES', 5)
 MONITOR_PRE_ALERT_MAX_SECONDS = 20
 MONITOR_PRE_ALERT_MIN_SECONDS = 10
@@ -295,7 +295,7 @@ monitor_last_heartbeat_at = None
 # Scanner automático de externos
 _auto_scan_active = False
 _auto_scan_last_alerted: dict = {}   # key: "ATIVO_DIR" -> timestamp do último alerta
-_AUTO_SCAN_COOLDOWN = 1800           # segundos entre alertas repetidos do mesmo ativo+dir
+_AUTO_SCAN_COOLDOWN = 600            # segundos entre alertas repetidos do mesmo ativo+dir
 
 # Fluxo de sinal único: envia o melhor sinal, aguarda expiração, reporta resultado, cooldown
 _scan_pending_signal: dict = {}      # sinal aguardando expiração para checagem de resultado
@@ -307,13 +307,13 @@ SCAN_STRICT_NOISE_FILTER = _env_flag(get_profile_env('SCAN_STRICT_NOISE_FILTER')
 SCAN_STRICT_MAX_WEAK_FACTORS = _env_int('SCAN_STRICT_MAX_WEAK_FACTORS', 2, min_value=1)
 
 # Filtros de qualidade otimizados (reduzem falsos positivos)
-MIN_ALERT_PROBABILITY = 60.0  # Perfil equilibrado para 5m
-MIN_ALERT_EDGE = 0.10  # Distância mínima de 0.5 (score 0.60 ou 0.40)
+MIN_ALERT_PROBABILITY = 55.0  # Perfil equilibrado para 5m
+MIN_ALERT_EDGE = 0.07  # Distância mínima de 0.5 (score 0.60 ou 0.40)
 MIN_SIGNAL_CONSENSUS = 3  # Pelo menos 3 dos 4 indicadores principais devem concordar
 
 # Ajuste para 1m: ainda seletivo, mas sem zerar completamente a frequência.
-MIN_ALERT_PROBABILITY_1M = 58.0
-MIN_ALERT_EDGE_1M = 0.08
+MIN_ALERT_PROBABILITY_1M = 53.0
+MIN_ALERT_EDGE_1M = 0.06
 MIN_SIGNAL_CONSENSUS_1M = 3
 MIN_SETUP_SCORE = 4     # score minimo 4/8 para 5m+ (elimina setups sem estrutura)
 MIN_SETUP_SCORE_1M = 6
@@ -2202,7 +2202,7 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
         buy_analysis = confluence_system.get_confluence_score(df, 'BUY', signal_data)
         sell_analysis = confluence_system.get_confluence_score(df, 'SELL', signal_data)
 
-        # Escolhe direcao com maior pontuacao
+        # Escolhe a direção com maior pontuação
         if buy_analysis['final_score'] >= sell_analysis['final_score']:
             analysis = buy_analysis
             direction = 'BUY'
@@ -2218,7 +2218,7 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
         raw_score_pct = int(analysis.get('raw_score_pct', score_pct))
         recommendation_raw = str(analysis.get('recommendation', direction))
 
-        # 1. Monta Breakdown e extrai Consenso REAL
+        # 1. Monta o Breakdown e extrai o Consenso REAL
         scores = analysis.get('scores', {})
         weights = analysis.get('weights', {})
         techniques = {
@@ -2277,8 +2277,8 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
         breakdown_text = '\n'.join(breakdown_lines)
         directional_text = '\n'.join(directional_lines)
 
-        # 2. Corrige Bipolaridade (Decisao Segura)
-        confluence = factors_pro
+        # 2. Corrige a Bipolaridade (Decisão Segura)
+        confluence = factors_pro 
         is_weak = score_pct < 55 or confluence < 3 or recommendation_raw.startswith('WEAK_')
 
         if is_weak:
@@ -2303,6 +2303,7 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
         else:
             confluence_label, confluence_emoji = 'BAIXA', '⚪'
 
+        # Próximo horário de entrada
         now_local = datetime.now()
         tf_min = timeframe_to_minutes(current_timeframe)
         if tf_min < 60:
@@ -2318,6 +2319,7 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
         entry_str = entry_dt.strftime('%H:%M')
         expiry_label = f'{tf_min}min' if tf_min < 60 else f'{tf_min // 60}h'
 
+        # Construir mensagem final
         message = (
             f"🔥 *ANÁLISE ATLAS — {current_symbol}*\n"
             f"📅 {now_local.strftime('%d/%m/%Y %H:%M:%S')}\n"
@@ -2340,6 +2342,7 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
         if not is_weak:
             message += f"❗️ Entrada sugerida: `{entry_str}` UTC-3 | Expiração: {expiry_label}\n"
 
+        # Viés tático para curto prazo (scalp)
         tactical_lines = []
         if adx < 15:
             bullish_tactical = stoch_k > stoch_d and stoch_k < 35 and close >= ema9
@@ -5205,30 +5208,27 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
 🕐 {datetime.now().strftime('%H:%M:%S')}
                     """
                 else:
-                    message = f"""
-🚨 **ALERTA DE SINAL!**
-
-{emoji} **{action} - {symbol}**
-
-⏰ **PRE-ALERTA (janela {int(effective_pre_alert_max)}s-{int(effective_pre_alert_min)}s): ENTRAR NA ABERTURA DO PRÓXIMO CANDLE ({next_candle.strftime('%H:%M')})**
-💵 Preço Referência: ${current_price:,.2f}{primary_trend_line}
-{entry_profile_line}
-🧠 Setup: {setup['setup_type']}
-🏗 Score estrutural: {setup['score']}/{max(8, min_setup_score + 1)}
-📊 Score base: {score:.3f}
-📊 Score ATLAS: {atlas_score:.3f} ({atlas_score_pct}%)
-📈 Probabilidade: {probability:.1f}%
-✅ Consenso de indicadores: {consensus}/4
-🧪 Classificação ATLAS: {atlas_recommendation}
-✅ Confluência ATLAS: {atlas_confluence}/5 técnicas
-
-🔎 Confirmações:
-• """ + "\n• ".join(setup['confirmations']) + f"""
-
-⏱ Timeframe: {timeframe}
-⏳ Expiração binária: {expiry_candles} candle{'s' if expiry_candles > 1 else ''} (~{expiry_minutes} min)
-🕐 {datetime.now().strftime('%H:%M:%S')}
-                    """
+                    _confs = "\n• ".join(setup['confirmations'])
+                    message = (
+                        f"🔥 *ATLAS — {action} {symbol}* {emoji}\n"
+                        f"⏱ `{timeframe}` | 🕐 `{next_candle.strftime('%H:%M')}` | 💵 `${current_price:,.2f}`\n"
+                    )
+                    if primary_trend_line and primary_trend_line.strip():
+                        message += f"{primary_trend_line.strip()}\n"
+                    message += (
+                        f"\n⏰ *Entrar na abertura do próximo candle* `({next_candle.strftime('%H:%M')})`\n\n"
+                        f"📊 Score ATLAS: *{atlas_score_pct}%* | Confluência: *{atlas_confluence}/5*\n"
+                        f"🧪 Classificação: *{atlas_recommendation}*\n"
+                        f"📈 Probabilidade: *{probability:.1f}%*\n"
+                        f"✅ Consenso: *{consensus}/4* técnicas\n"
+                        f"🏗 Setup: *{setup['setup_type']}* (score {setup['score']}/{max(8, min_setup_score + 1)})\n"
+                    )
+                    if entry_profile_line and entry_profile_line.strip():
+                        message += f"{entry_profile_line.strip()}\n"
+                    message += (
+                        f"\n🔎 *Confirmações:*\n• {_confs}\n"
+                        f"\n⏳ Expiração: {expiry_candles} candle{'s' if expiry_candles > 1 else ''} (~{expiry_minutes}min)"
+                    )
 
                 if setup['warnings']:
                     message += "\n⚠️ Pontos de atenção:\n• " + "\n• ".join(setup['warnings'])

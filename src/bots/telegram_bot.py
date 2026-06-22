@@ -2214,117 +2214,114 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
             base_dir_label = 'VENDA'
             base_dir_emoji = '🔴'
 
-        score_pct = int(analysis.get('final_score_pct', round(analysis['final_score'] * 100)))
+        score_pct     = int(analysis.get('final_score_pct', round(analysis['final_score'] * 100)))
         raw_score_pct = int(analysis.get('raw_score_pct', score_pct))
         recommendation_raw = str(analysis.get('recommendation', direction))
 
-        # 1. Monta Breakdown e extrai Consenso REAL
-        scores = analysis.get('scores', {})
+        scores  = analysis.get('scores', {})
         weights = analysis.get('weights', {})
         techniques = {
-            'smc': ('🎯 SMC', float(weights.get('smc', 0.30))),
-            'wyckoff': ('📊 Wyckoff', float(weights.get('wyckoff', 0.25))),
+            'smc':          ('🎯 SMC',         float(weights.get('smc',          0.30))),
+            'wyckoff':      ('📊 Wyckoff',      float(weights.get('wyckoff',      0.25))),
             'price_action': ('🕯 Price Action', float(weights.get('price_action', 0.20))),
-            'traditional': ('📈 Tradicional', float(weights.get('traditional', 0.15))),
-            'elliott': ('🌊 Elliott Wave', float(weights.get('elliott', 0.10))),
+            'traditional':  ('📈 Tradicional',  float(weights.get('traditional',  0.15))),
+            'elliott':      ('🌊 Elliott Wave', float(weights.get('elliott',      0.10))),
         }
 
-        breakdown_lines = []
+        breakdown_lines  = []
         directional_lines = []
-        factors_pro = 0
-        factors_contra = 0
-        factors_neutral = 0
+        factors_pro = factors_contra = factors_neutral = 0
 
         for key, (name, weight) in techniques.items():
             individual = float(scores.get(key, 0.0))
-            buy_val = float(buy_analysis.get('scores', {}).get(key, 0.0))
-            sell_val = float(sell_analysis.get('scores', {}).get(key, 0.0))
-            dominant = max(buy_val, sell_val)
-            diff = abs(buy_val - sell_val)
+            buy_val    = float(buy_analysis.get('scores',  {}).get(key, 0.0))
+            sell_val   = float(sell_analysis.get('scores', {}).get(key, 0.0))
+            dominant   = max(buy_val, sell_val)
+            diff       = abs(buy_val - sell_val)
 
             if dominant < 0.20 or diff < 0.08:
-                side = 'NEUTRO'
-                side_emoji = '⚪'
-                agreement_icon = '⚪'
-                factors_neutral += 1
+                side = 'NEUTRO'; side_emoji = '⚪'; agreement_icon = '⚪'; factors_neutral += 1
             elif buy_val > sell_val:
-                side = 'COMPRA'
-                side_emoji = '🟢'
+                side = 'COMPRA'; side_emoji = '🟢'
                 if direction == 'BUY':
-                    agreement_icon = '✅'
-                    factors_pro += 1
+                    agreement_icon = '✅'; factors_pro += 1
                 else:
-                    agreement_icon = '❌'
-                    factors_contra += 1
+                    agreement_icon = '❌'; factors_contra += 1
             else:
-                side = 'VENDA'
-                side_emoji = '🔴'
+                side = 'VENDA'; side_emoji = '🔴'
                 if direction == 'SELL':
-                    agreement_icon = '✅'
-                    factors_pro += 1
+                    agreement_icon = '✅'; factors_pro += 1
                 else:
-                    agreement_icon = '❌'
-                    factors_contra += 1
+                    agreement_icon = '❌'; factors_contra += 1
 
             individual_pct = int(round(individual * 100))
-            contrib_pct = int(round(individual * weight * 100))
-            b_pct = int(round(buy_val * 100))
+            contrib_pct    = int(round(individual * weight * 100))
+            b_pct = int(round(buy_val  * 100))
             s_pct = int(round(sell_val * 100))
-
-            breakdown_lines.append(f"{agreement_icon} {name} ({int(weight*100)}%): {individual_pct}% (contrib: {contrib_pct}pp)")
+            breakdown_lines.append(  f"{agreement_icon} {name} ({int(weight*100)}%): {individual_pct}% (contrib: {contrib_pct}pp)")
             directional_lines.append(f"{side_emoji} {name}: {side} (B:{b_pct}% | S:{s_pct}%)")
 
-        breakdown_text = '\n'.join(breakdown_lines)
+        breakdown_text   = '\n'.join(breakdown_lines)
         directional_text = '\n'.join(directional_lines)
 
-        # 2. Corrige Bipolaridade (Decisao Segura)
+        # ── Decisão modo AGRESSIVO ──────────────────────────────
         confluence = factors_pro
-        is_weak = score_pct < 55 or confluence < 3 or recommendation_raw.startswith('WEAK_')
+        smc_buy  = float(buy_analysis.get('scores',  {}).get('smc', 0))
+        smc_sell = float(sell_analysis.get('scores', {}).get('smc', 0))
+        has_transfer = max(smc_buy, smc_sell) >= 0.60
+
+        if has_transfer:
+            is_weak = score_pct < 40 or confluence < 2 or recommendation_raw.startswith('WEAK_')
+        else:
+            is_weak = score_pct < 48 or confluence < 2 or recommendation_raw.startswith('WEAK_')
 
         if is_weak:
             dir_label = 'NEUTRO / OBSERVAR'
             rec_emoji = '⚪'
-            strength = 'AGUARDE (Sinal Fraco)'
+            strength  = 'AGUARDE (Sinal Fraco)'
             recommendation_display = 'HOLD / NEUTRAL'
         else:
             dir_label = base_dir_label
             recommendation_display = recommendation_raw
-            if recommendation_raw.startswith('STRONG_') or (confluence >= 4 and score_pct >= 70):
-                strength = 'FORTE'
+            if recommendation_raw.startswith('STRONG_') or (confluence >= 3 and score_pct >= 58):
+                strength  = 'FORTE'
                 rec_emoji = base_dir_emoji
             else:
-                strength = 'MODERADO'
+                strength  = 'MODERADO'
                 rec_emoji = '🟡'
 
-        if confluence >= 4 and score_pct >= 60:
-            confluence_label, confluence_emoji = 'ALTA', '🟢'
-        elif confluence >= 3 and score_pct >= 45:
+        if confluence >= 4 and score_pct >= 55:
+            confluence_label, confluence_emoji = 'ALTA',  '🟢'
+        elif confluence >= 2 and score_pct >= 38:
             confluence_label, confluence_emoji = 'MEDIA', '🟡'
         else:
             confluence_label, confluence_emoji = 'BAIXA', '⚪'
 
+        # ── Horário de entrada ──────────────────────────────────
         now_local = datetime.now()
-        tf_min = timeframe_to_minutes(current_timeframe)
+        tf_min    = timeframe_to_minutes(current_timeframe)
         if tf_min < 60:
             import math as _math
-            total_min = now_local.minute + now_local.second / 60 + 0.02
-            next_tf_min = _math.ceil(total_min / tf_min) * tf_min
+            total_min    = now_local.minute + now_local.second / 60 + 0.02
+            next_tf_min  = _math.ceil(total_min / tf_min) * tf_min
             if next_tf_min >= 60:
                 entry_dt = now_local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
             else:
                 entry_dt = now_local.replace(minute=int(next_tf_min), second=0, microsecond=0)
         else:
             entry_dt = now_local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=tf_min // 60)
-        entry_str = entry_dt.strftime('%H:%M')
+        entry_str    = entry_dt.strftime('%H:%M')
         expiry_label = f'{tf_min}min' if tf_min < 60 else f'{tf_min // 60}h'
 
+        # ── Mensagem principal ──────────────────────────────────
+        transfer_tag = ' 💧Liquidez' if has_transfer else ''
         message = (
             f"🔥 *ANÁLISE ATLAS — {current_symbol}*\n"
             f"📅 {now_local.strftime('%d/%m/%Y %H:%M:%S')}\n"
             f"⏱ Timeframe: `{current_timeframe}`\n"
             f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n"
             f"📉 Stoch K/D: `{stoch_k:.1f}/{stoch_d:.1f}`\n\n"
-            f"{rec_emoji} *RECOMENDAÇÃO: {dir_label} — {strength}*\n"
+            f"{rec_emoji} *RECOMENDAÇÃO: {dir_label} — {strength}*{transfer_tag}\n"
             f"🎯 Score de Confluência: *{score_pct}%* (bruto: {raw_score_pct}%)\n"
             f"🧪 Classificação ATLAS: *{recommendation_display}*\n"
             f"✅ Consenso: *{confluence}/5 técnicas* concordam\n\n"
@@ -2340,14 +2337,15 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
         if not is_weak:
             message += f"❗️ Entrada sugerida: `{entry_str}` UTC-3 | Expiração: {expiry_label}\n"
 
+        # ── Viés tático scalp ───────────────────────────────────
         tactical_lines = []
         if adx < 15:
-            bullish_tactical = stoch_k > stoch_d and stoch_k < 35 and close >= ema9
-            bearish_tactical = stoch_k < stoch_d and stoch_k > 65 and close <= ema9
-            if bullish_tactical:
+            bullish_t = stoch_k > stoch_d and stoch_k < 35 and close >= ema9
+            bearish_t = stoch_k < stoch_d and stoch_k > 65 and close <= ema9
+            if bullish_t:
                 tactical_lines.append("🟢 *Viés tático (scalp):* compra de curto prazo possível")
                 tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para cima em região descontada")
-            elif bearish_tactical:
+            elif bearish_t:
                 tactical_lines.append("🔴 *Viés tático (scalp):* venda de curto prazo possível")
                 tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para baixo em região esticada")
 
@@ -2357,9 +2355,9 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
         if is_weak:
             if recommendation_raw.startswith('WEAK_'):
                 message += "\n⚠️ *Atenção:* Sinal fraco (WEAK) — sem entrada recomendada"
-            elif score_pct < 55:
+            elif score_pct < 48:
                 message += "\n⚠️ *Atenção:* Score baixo — aguarde configuração mais clara"
-            elif confluence < 3:
+            elif confluence < 2:
                 message += f"\n⚠️ *Atenção:* Apenas {confluence}/5 técnicas concordam — sinal fraco"
 
         await update.message.reply_text(message, parse_mode='Markdown')

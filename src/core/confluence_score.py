@@ -53,10 +53,10 @@ class ConfluenceScoreSystem:
     NORMALIZATION_BIAS = float(os.getenv('ATLAS_NORMALIZATION_BIAS', '0.45'))
     AGREEMENT_THRESHOLD = float(os.getenv('ATLAS_AGREEMENT_THRESHOLD', '0.30'))
 
-    STRONG_MIN_SCORE = float(os.getenv('ATLAS_STRONG_MIN_SCORE', '0.68'))
-    STRONG_MIN_CONFLUENCE = int(os.getenv('ATLAS_STRONG_MIN_CONFLUENCE', '4'))
-    MIN_SCORE = float(os.getenv('ATLAS_MIN_SCORE', '0.50'))
-    MIN_CONFLUENCE = int(os.getenv('ATLAS_MIN_CONFLUENCE', '3'))
+    STRONG_MIN_SCORE = float(os.getenv('ATLAS_STRONG_MIN_SCORE', '0.58'))
+    STRONG_MIN_CONFLUENCE = int(os.getenv('ATLAS_STRONG_MIN_CONFLUENCE', '3'))
+    MIN_SCORE = float(os.getenv('ATLAS_MIN_SCORE', '0.38'))
+    MIN_CONFLUENCE = int(os.getenv('ATLAS_MIN_CONFLUENCE', '2'))
 
     
     def __init__(self):

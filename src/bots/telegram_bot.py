@@ -196,6 +196,7 @@ confluence_system = ConfluenceScoreSystem()
 
 # Lista de ativos monitorados inicial por perfil
 DEFAULT_CRYPTO_MONITORED_SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 'ADA/USDT']
+DEFAULT_SCAN_EXTERNAL_SYMBOLS = os.getenv('SCAN_EXTERNAL_SYMBOLS', 'XAU/USD,US500,GBP/JPY,EUR/USD').split(',')
 DEFAULT_FOREX_MONITORED_SYMBOLS = ['XAU/USD', 'US500']
 _crypto_monitored_symbols_raw = os.getenv(
     'CRYPTO_MONITORED_SYMBOLS',
@@ -300,23 +301,23 @@ _AUTO_SCAN_COOLDOWN = 1800           # segundos entre alertas repetidos do mesmo
 # Fluxo de sinal único: envia o melhor sinal, aguarda expiração, reporta resultado, cooldown
 _scan_pending_signal: dict = {}      # sinal aguardando expiração para checagem de resultado
 _scan_last_signal_ts: float = 0.0   # timestamp do último sinal enviado
-_SCAN_SIGNAL_INTERVAL = int(os.getenv('SCAN_SIGNAL_INTERVAL', '1800'))  # cooldown entre sinais (s), padrão 30min
+_SCAN_SIGNAL_INTERVAL = int(os.getenv('SCAN_SIGNAL_INTERVAL', '600'))   # AGRESSIVO: era 1800s (30min) → 10min 30min
 SCAN_POLL_SECONDS = _env_int('SCAN_POLL_SECONDS', 60, min_value=15)
 SCAN_MIN_ENTRY_LEAD_SECONDS = _env_int('SCAN_MIN_ENTRY_LEAD_SECONDS', 60, min_value=10)
-SCAN_STRICT_NOISE_FILTER = _env_flag(get_profile_env('SCAN_STRICT_NOISE_FILTER'), default=True)
-SCAN_STRICT_MAX_WEAK_FACTORS = _env_int('SCAN_STRICT_MAX_WEAK_FACTORS', 2, min_value=1)
+SCAN_STRICT_NOISE_FILTER = _env_flag(get_profile_env('SCAN_STRICT_NOISE_FILTER'), default=False)  # AGRESSIVO: desligado
+SCAN_STRICT_MAX_WEAK_FACTORS = _env_int('SCAN_STRICT_MAX_WEAK_FACTORS', 3, min_value=1)
 
-# Filtros de qualidade otimizados (reduzem falsos positivos)
-MIN_ALERT_PROBABILITY = 60.0  # Perfil equilibrado para 5m
-MIN_ALERT_EDGE = 0.10  # Distância mínima de 0.5 (score 0.60 ou 0.40)
-MIN_SIGNAL_CONSENSUS = 3  # Pelo menos 3 dos 4 indicadores principais devem concordar
+# Filtros de qualidade — MODO AGRESSIVO (mais sinais para testes)
+MIN_ALERT_PROBABILITY = 48.0   # era 60.0 → baixado para gerar mais alertas
+MIN_ALERT_EDGE = 0.05          # era 0.10 → mais permissivo
+MIN_SIGNAL_CONSENSUS = 2       # era 3 → aceita 2/5 técnicas
 
-# Ajuste para 1m: ainda seletivo, mas sem zerar completamente a frequência.
-MIN_ALERT_PROBABILITY_1M = 58.0
-MIN_ALERT_EDGE_1M = 0.08
-MIN_SIGNAL_CONSENSUS_1M = 3
-MIN_SETUP_SCORE = 4     # score minimo 4/8 para 5m+ (elimina setups sem estrutura)
-MIN_SETUP_SCORE_1M = 6
+# Ajuste para 1m — AGRESSIVO
+MIN_ALERT_PROBABILITY_1M = 45.0  # era 58.0
+MIN_ALERT_EDGE_1M = 0.04         # era 0.08
+MIN_SIGNAL_CONSENSUS_1M = 2      # era 3
+MIN_SETUP_SCORE = 3     # era 4 — aceita setups mais fracos
+MIN_SETUP_SCORE_1M = 4  # era 6
 
 MONITOR_INDICATORS_CONFIG = {
     **config.INDICATORS_CONFIG,
@@ -2751,7 +2752,7 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📡 *Scanner automático: {status_icon}*{cooldown_info}{pending_info}\n\n"
             f"🔥 *Engine:* ATLAS — Sistema de Confluência (5 técnicas)\n"
             f"📊 *Técnicas:* SMC (30%), Wyckoff (25%), Price Action (20%), Tradicional (15%), Elliott (10%)\n"
-            f"🎯 *Consenso:* ≥ 3/5 técnicas + Score ≥ 65%\n"
+            f"🎯 *Consenso:* ≥ 2/5 técnicas + Score ≥ 48% (modo agressivo)\n"
             f"🛡 *Filtros:* Tier liquidez + ADX + Sessão ativa\n\n"
             f"💹 *Crypto ({total_crypto} ativos com TIER):*\n"
             f"  • TIER 1 (24/7): {', '.join(crypto_tier1)}\n"
@@ -3050,14 +3051,14 @@ def _get_crypto_signal_profile(asset: str) -> dict:
         return {
             'tier': 2,
             'tier_name': 'Large Cap',
-            'min_score': 0.55,           # Score 55%
-            'min_adx': 26.0,             # ADX mais alto que Tier 1
-            'buy_rsi_block': 68.0,
-            'sell_rsi_block': 32.0,
+            'min_score': 0.48,           # AGRESSIVO: era 0.55
+            'min_adx': 22.0,             # AGRESSIVO: era 26.0
+            'buy_rsi_block': 72.0,       # AGRESSIVO: era 68.0
+            'sell_rsi_block': 28.0,      # AGRESSIVO: era 32.0
             'require_mtf_for_all': False,
-            'min_score_without_mtf': 5,
-            'liquidity_check': True,     # Requer sessão ativa
-            'min_session_level': 'any',  # Londres OU NY (não precisa overlap)
+            'min_score_without_mtf': 3,  # AGRESSIVO: era 5
+            'liquidity_check': False,    # AGRESSIVO: desligado para testar
+            'min_session_level': 'any',
         }
     
     # TIER 3: ADA/DOGE/LTC - Alts com alta volatilidade
@@ -3189,7 +3190,7 @@ def _is_forex_session_active() -> tuple:
     if new_york:
         return True, 'Nova York'
     if asian:
-        return True, 'Asiática (liquidez reduzida)'
+        return True, 'Asiática (liquidez reduzida)'  # AGRESSIVO: aceita asiática
     
     # Horários de transição (07:00-08:00, 16:00-22:00)
     return True, f'Sessão aberta ({utc.hour:02d}:{utc.minute:02d} UTC)'

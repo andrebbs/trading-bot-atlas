@@ -33,6 +33,22 @@ from src.core.confluence_score import ConfluenceScoreSystem
 from src.utils.pocket_signal_parser import PocketSignalParser, TradingSignal
 from config import config
 
+# ── ATLAS compat ─────────────────────────────────────────────────
+try:
+    from src.core.intelligent_scanner import (
+        get_asset_profile, analyze_market_snapshot, rank_opportunities
+    )
+except Exception:
+    get_asset_profile = analyze_market_snapshot = rank_opportunities = None
+
+BITGET_EXECUTOR_ENABLED = False
+bitget_executor = None
+
+def _now_str() -> str:
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# ─────────────────────────────────────────────────────────────────
+
 # Perfil da instância do bot: main | abbs-forex-bot etc.
 BOT_PROFILE = os.getenv('BOT_PROFILE', 'main').strip().lower() or 'main'
 

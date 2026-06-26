@@ -1,1 +1,0 @@
-"""Message formatters for Telegram."""

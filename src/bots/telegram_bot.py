@@ -296,7 +296,7 @@ monitor_last_heartbeat_at = None
 # Scanner automático de externos
 _auto_scan_active = False
 _auto_scan_last_alerted: dict = {}   # key: "ATIVO_DIR" -> timestamp do último alerta
-_AUTO_SCAN_COOLDOWN = 1800           # segundos entre alertas repetidos do mesmo ativo+dir
+_AUTO_SCAN_COOLDOWN = 600            # ATLAS: cooldown 10min por ativo+direção
 
 # Fluxo de sinal único: envia o melhor sinal, aguarda expiração, reporta resultado, cooldown
 _scan_pending_signal: dict = {}      # sinal aguardando expiração para checagem de resultado
@@ -3066,14 +3066,14 @@ def _get_crypto_signal_profile(asset: str) -> dict:
         return {
             'tier': 3,
             'tier_name': 'Alt Coin',
-            'min_score': 0.60,           # Score 60% (mais rigoroso)
-            'min_adx': 30.0,             # ADX 30+ (tendência forte obrigatória)
+            'min_score': 0.48,           # ATLAS: Tier3 alinhado ao modo agressivo
+            'min_adx': 22.0,             # ATLAS: ADX mínimo Tier3
             'buy_rsi_block': 64.0,
             'sell_rsi_block': 36.0,
             'require_mtf_for_all': True, # Confirmação MTF obrigatória
-            'min_score_without_mtf': 7,  # Pontuação alta sem MTF
+            'min_score_without_mtf': 3,  # ATLAS: alinhado ao modo agressivo
             'liquidity_check': True,     # Requer sessão ativa
-            'min_session_level': 'overlap',  # APENAS overlap Londres+NY (12-16h UTC)
+            'min_session_level': 'any',      # ATLAS: aceita qualquer sessão
         }
     
     # Default: trata como Tier 3 (mais conservador)
@@ -3743,522 +3743,260 @@ async def check_paper_trades(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
-    """Job agendado: envia o MELHOR sinal disponível (1 por ciclo).
-    Fluxo: detecta → envia sinal → aguarda expiração → reporta resultado (WIN/LOSS) → cooldown → repete.
+    """
+    Scanner automático ATLAS — único motor de decisão.
+    Fluxo: ATLAS analisa → SignalEvaluator decide → Bitget executa (se ligado)
+    Motor legado (EMA/MTF/Proteções) removido em refactor/atlas-single-engine.
     """
     global _auto_scan_active, _auto_scan_last_alerted, _scan_pending_signal, _scan_last_signal_ts
+
     if not _auto_scan_active:
         return
 
-    chat_id = monitor_target_chat_id or get_telegram_chat_id()
+    chat_id = context.job.chat_id if hasattr(context, 'job') and context.job else None
     if not chat_id:
         return
 
-    from src.core import bitget_executor as _bx
-    try:
-        from src.core import economic_calendar as _eco
-    except ImportError:
-        _eco = None
-
-    import math as _math
     now_ts = time.time()
 
-    # ── PASSO 1: verificar resultado do sinal pendente ─────────────────────
-    if _scan_pending_signal:
-        pend = _scan_pending_signal
-        # ── PRÉ-ANÁLISE: verificar PRIMEIRO (garante envio mesmo se expirou no intervalo)
-        if not pend.get('pre_analysis_sent') and now_ts >= pend.get('pre_analysis_ts', float('inf')):
-            pend['pre_analysis_sent'] = True
-            try:
-                pa = _get_tv_analysis(pend['asset'], '5m')
-                direction  = pend['direction']
-                op_label = 'COMPRA' if direction == 'BUY' else 'VENDA'
-                p1_time = datetime.fromtimestamp(pend['expiry_ts']).strftime('%H:%M')
-
-                if pa:
-                    asset_type = 'forex' if pend['asset'].upper() in EXTERNAL_FOREX else 'crypto'
-                    adx_min    = 25 if asset_type == 'forex' else 20
-                    close  = pa.get('close', 0)
-                    ema20  = pa.get('EMA20', 0)
-                    rsi    = pa.get('RSI', 50)
-                    adx    = pa.get('ADX', 0)
-                    entry_price = float(pend.get('entry_price') or 0.0)
-                    epsilon = max(entry_price * 0.00002, 1e-6) if entry_price > 0 else 1e-6
-                    # Checa WIN independente de expiração: se já moveu a favor, não reentrar
-                    already_won = False
-                    if entry_price > 0:
-                        if direction == 'BUY':
-                            already_won = close > (entry_price + epsilon)
-                        else:
-                            already_won = close < (entry_price - epsilon)
-
-                    if already_won:
-                        move_pct = (close - entry_price) / entry_price * 100 if entry_price else 0.0
-                        if direction == 'SELL':
-                            move_pct = -move_pct
-                        pre_msg = (
-                            f"🔄 *PRÉ-ANÁLISE — {pend['asset']} P1 ({p1_time})*\n\n"
-                            f"❌ *NÃO REENTRAR*\n"
-                            f"  • Entrada principal já confirmou *WIN* ({move_pct:+.2f}%)\n"
-                            f"  • Prioridade: preservar resultado e evitar overtrading"
-                        )
-                    else:
-                        # Condicoes de re-entrada: evita falso "rompeu EMA20" quando preco segue
-                        # no mesmo lado, mas muito colado na media.
-                        ema_buffer = ema20 * 0.0001 if ema20 else 0.0  # 0.01%
-                        if direction == 'BUY':
-                            price_ok = close >= (ema20 + ema_buffer)
-                        else:
-                            price_ok = close <= (ema20 - ema_buffer)
-                        rsi_ok   = (rsi < 65) if direction == 'BUY' else (rsi > 35)
-                        adx_ok   = adx >= adx_min
-                        valid    = price_ok and rsi_ok and adx_ok
-
-                        if valid:
-                            reasons_pa = []
-                            if price_ok:
-                                reasons_pa.append(f"Preco {'acima' if direction=='BUY' else 'abaixo'} EMA20 ({ema20:.4g})")
-                            reasons_pa.append(f"RSI {rsi:.0f} {'ok' if rsi_ok else 'limite'}")
-                            reasons_pa.append(f"ADX {adx:.1f} ({'ok' if adx_ok else 'fraco'})")
-                            pre_msg = (
-                                f"🔄 *PRÉ-ANÁLISE — {pend['asset']} P1 ({p1_time})*\n\n"
-                                f"✅ *RE-ENTRADA {op_label} VÁLIDA*\n"
-                                + '\n'.join(f'  • {r}' for r in reasons_pa)
-                            )
-                        else:
-                            fail_reasons = []
-                            if not price_ok:
-                                if ema20 <= 0:
-                                    fail_reasons.append("EMA20 indisponivel no momento")
-                                elif (direction == 'BUY' and close <= ema20) or (direction == 'SELL' and close >= ema20):
-                                    fail_reasons.append(f"Preco no lado oposto da EMA20 ({ema20:.4g}) — possivel reversao")
-                                else:
-                                    fail_reasons.append(f"Preco colado na EMA20 ({ema20:.4g}) — sem distancia de seguranca")
-                            if not rsi_ok:
-                                fail_reasons.append(f"RSI {rsi:.0f} — {'sobrecomprado' if direction=='BUY' else 'sobrevendido'}")
-                            if not adx_ok:
-                                fail_reasons.append(f"ADX {adx:.1f} < {adx_min} — momentum perdido")
-                            pre_msg = (
-                                f"🔄 *PRÉ-ANÁLISE — {pend['asset']} P1 ({p1_time})*\n\n"
-                                f"❌ *NÃO REENTRAR*\n"
-                                + '\n'.join(f'  • {r}' for r in fail_reasons)
-                            )
-                else:
-                    pre_msg = (
-                        f"🔄 *PRÉ-ANÁLISE — {pend['asset']} P1 ({p1_time})*\n\n"
-                        f"⚠️ *Dados temporariamente indisponíveis*\n"
-                        f"❌ *NÃO REENTRAR {op_label} sem confirmação*"
-                    )
-
-                await context.bot.send_message(chat_id=chat_id, text=pre_msg, parse_mode='Markdown')
-            except Exception as _pe:
-                logger.warning('[scan] pre_analysis erro: %s', _pe)
-            if now_ts < pend['expiry_ts']:
-                return  # não expirou ainda — aguarda próximo ciclo
-            # já expirou durante o intervalo → segue direto para o resultado
-        if now_ts >= pend['expiry_ts']:
-            # Expirou — avalia pelo candle 5m da operação (fallback: spot TV)
-            try:
-                cur_price, price_source = _get_scan_expiry_candle_close(pend)
-                if cur_price is None:
-                    cur = _get_tv_analysis(pend['asset'], '5m')
-                    cur_price = cur.get('close') if cur else None
-                    price_source = 'spot TradingView (fallback)'
-                if cur_price:
-                    entry_price = pend['entry_price']
-                    direction   = pend['direction']
-                    # Ignora micro-diferenças para reduzir falso LOSS/WIN por ruído de cotação.
-                    epsilon = max(float(entry_price) * 0.00002, 1e-6)
-                    if direction == 'BUY':
-                        if cur_price > entry_price + epsilon:
-                            outcome = 'WIN'
-                        elif cur_price < entry_price - epsilon:
-                            outcome = 'LOSS'
-                        else:
-                            outcome = 'TIE'
-                    else:
-                        if cur_price < entry_price - epsilon:
-                            outcome = 'WIN'
-                        elif cur_price > entry_price + epsilon:
-                            outcome = 'LOSS'
-                        else:
-                            outcome = 'TIE'
-
-                    won = outcome == 'WIN'
-                    move_pct = (cur_price - entry_price) / entry_price * 100
-                    if direction == 'SELL':
-                        move_pct = -move_pct
-                    op_label = 'COMPRA' if direction == 'BUY' else 'VENDA'
-                    if not pend.get('executed', True):
-                        theoretical = 'WIN teórico' if outcome == 'WIN' else ('LOSS teórico' if outcome == 'LOSS' else 'empate técnico')
-                        result_line = '📌 *RESULTADO TEÓRICO*'
-                    elif outcome == 'WIN':
-                        result_line = '✅ *VITÓRIA*'
-                    elif outcome == 'LOSS':
-                        result_line = '❌ *PERDA*'
-                    else:
-                        result_line = '⚪️ *EMPATE TÉCNICO*'
-                    interval_min = _SCAN_SIGNAL_INTERVAL // 60
-                    no_position_note = (
-                        f'\n⚠️ _Sem posição real — execução falhou ou pausada ({theoretical})_'
-                        if not pend.get('executed', True) else ''
-                    )
-                    result_msg = (
-                        f"{result_line} — {pend['asset']} {op_label}\n\n"
-                        f"Entrada: `{entry_price:.4g}` → Atual: `{cur_price:.4g}`\n"
-                        f"Fonte de resultado: `{price_source}`\n"
-                        f"Variação: `{move_pct:+.2f}%`\n"
-                        f"Qualidade do sinal: _{pend['quality']}_"
-                        f"{no_position_note}\n\n"
-                        f"_Próximo sinal em ~{interval_min} min_"
-                    )
-                    await context.bot.send_message(chat_id=chat_id, text=result_msg, parse_mode='Markdown')
-            except Exception:
-                pass
-            _scan_pending_signal = {}
-            # Cooldown começa a partir do resultado (não do sinal)
-            _scan_last_signal_ts = now_ts
-        else:
-            # Sinal ainda não expirou — aguarda
-            remaining = int(pend['expiry_ts'] - now_ts)
-            logger.debug('[scan] sinal pendente %s %s — expira em %ds', pend['asset'], pend['direction'], remaining)
-            return
-
-    # ── PASSO 2: verificar cooldown entre sinais ───────────────────────────
+    # ── Cooldown global entre sinais (evita spam) ────────────────────────────
     if now_ts - _scan_last_signal_ts < _SCAN_SIGNAL_INTERVAL:
-        remaining_cd = int(_SCAN_SIGNAL_INTERVAL - (now_ts - _scan_last_signal_ts))
-        logger.debug('[scan] cooldown ativo — próximo sinal em %ds', remaining_cd)
+        remaining = int(_SCAN_SIGNAL_INTERVAL - (now_ts - _scan_last_signal_ts))
+        logger.debug(f"[ATLAS-SCAN] cooldown global: {remaining}s restantes")
         return
 
-    # ── PASSO 3: pré-check de eventos macro ───────────────────────────────
-    upcoming_events = []
-    if _eco:
-        try:
-            upcoming_events = _eco.get_upcoming_high_impact(minutes_ahead=30)
-        except Exception:
-            upcoming_events = []
-
-    # ── PASSO 4: varrer ativos e rankear por pontuação ────────────────────
-    candidates = []
-    # Sessão forex ativa? (bloqueia pares fora de London/NY)
-    forex_session_ok, forex_session_label = _is_forex_session_active()
-    market_mode = get_operation_market_mode()
-
-    seen_tv = set()
-    rejection_stats = {
-        'rsi_stretched': 0,
-        'mtf_required': 0,
-        'profile_block': 0,
-        'noise_block': 0,
-        'not_strong': 0,
-        'no_analysis': 0,
-    }
-
-    for asset, (screener, tv_ticker) in TV_TICKER_MAP.items():
-        if tv_ticker in seen_tv:
-            continue
-        seen_tv.add(tv_ticker)
-
-        is_forex = asset.upper() in EXTERNAL_FOREX
-        asset_type = 'forex' if is_forex else 'crypto'
-
-        # Filtro por modo operacional selecionado
-        if market_mode == 'crypto' and is_forex:
-            continue
-        if market_mode == 'forex' and not is_forex:
-            continue
-
-        crypto_profile = _get_crypto_signal_profile(asset) if asset_type == 'crypto' else None
-
-        # Bloqueia forex fora de sessão ativa
-        if is_forex and not forex_session_ok:
-            logger.debug('[scan] Forex %s ignorado — %s', asset, forex_session_label)
-            continue
-
-        for direction in ('BUY', 'SELL'):
+    # ── Verificar resultado do sinal pendente ────────────────────────────────
+    if _scan_pending_signal:
+        pending = _scan_pending_signal
+        entry_ts  = pending.get('entry_ts', 0)
+        duration  = pending.get('duration_s', 300)
+        if now_ts >= entry_ts + duration:
+            # Avalia resultado pelo preço atual
+            symbol   = pending.get('symbol', '')
+            direction= pending.get('direction', '')
+            entry_px = pending.get('entry_price', 0)
             try:
-                analysis = _get_tv_analysis(asset, timeframe='5m')
-                if not analysis:
-                    rejection_stats['no_analysis'] += 1
-                    continue
-                quality, reasons = _assess_signal_quality(analysis, direction, asset_type=asset_type)
-                if 'FORTE' not in quality:
-                    rejection_stats['not_strong'] += 1
-                    continue
-                score = sum(1 for r in reasons if r.startswith('✅'))
-                rsi_5m = analysis.get('RSI')
-                adx_5m = analysis.get('ADX')
-                close_5m = analysis.get('close')
-                ema50_5m = analysis.get('EMA50')
-                ema200_5m = analysis.get('EMA200')
+                tv_data  = _get_tv_analysis(symbol, '1m')
+                curr_px  = tv_data.get('close', 0) if tv_data else 0
+            except Exception:
+                curr_px  = 0
 
-                trend_aligned = True
-                if close_5m is not None and ema50_5m is not None and ema200_5m is not None:
-                    if direction == 'BUY':
-                        trend_aligned = close_5m > ema50_5m > ema200_5m
-                    else:
-                        trend_aligned = close_5m < ema50_5m < ema200_5m
-
-                if crypto_profile:
-                    adx_value = float(adx_5m) if adx_5m is not None else 0.0
-                    if adx_value < crypto_profile['min_adx']:
-                        logger.info(
-                            '[scan] bloqueado perfil cripto | %s %s adx=%.1f min=%.1f tier=%s',
-                            asset,
-                            direction,
-                            adx_value,
-                            crypto_profile['min_adx'],
-                            crypto_profile['tier'],
-                        )
-                        rejection_stats['profile_block'] += 1
-                        continue
-                    if score < crypto_profile['min_score_without_mtf']:
-                        logger.info(
-                            '[scan] bloqueado score perfil cripto | %s %s score=%s min=%s tier=%s',
-                            asset,
-                            direction,
-                            score,
-                            crypto_profile['min_score_without_mtf'],
-                            crypto_profile['tier'],
-                        )
-                        rejection_stats['profile_block'] += 1
-                        continue
-
-                # Evita entradas esticadas que costumam falhar em sequencia de protecoes.
-                if rsi_5m is not None:
-                    # Mais tolerante quando a tendencia está alinhada; mais rígido em contratendencia.
-                    if crypto_profile:
-                        buy_base = float(crypto_profile['buy_rsi_block'])
-                        sell_base = float(crypto_profile['sell_rsi_block'])
-                        buy_max = buy_base if trend_aligned else max(58.0, buy_base - 2.0)
-                        sell_min = sell_base if trend_aligned else min(42.0, sell_base + 2.0)
-                    else:
-                        buy_max = 68 if trend_aligned else 66
-                        sell_min = 32 if trend_aligned else 34
-                    if direction == 'BUY' and rsi_5m >= buy_max:
-                        logger.info('[scan] bloqueado RSI esticado | %s BUY RSI=%.1f', asset, rsi_5m)
-                        rejection_stats['rsi_stretched'] += 1
-                        continue
-                    if direction == 'SELL' and rsi_5m <= sell_min:
-                        logger.info('[scan] bloqueado RSI esticado | %s SELL RSI=%.1f', asset, rsi_5m)
-                        rejection_stats['rsi_stretched'] += 1
-                        continue
-
-                # Confirmação 15m
-                mtf_confirmed = False
+            if curr_px and entry_px:
+                won = (curr_px > entry_px) if direction == 'BUY' else (curr_px < entry_px)
+                result_emoji = '✅ WIN' if won else '❌ LOSS'
+                result_msg = (
+                    f"📊 *Resultado ATLAS — {symbol}*\n"
+                    f"Direção: {'COMPRA' if direction == 'BUY' else 'VENDA'}\n"
+                    f"Entrada: `{entry_px:.4g}` → Atual: `{curr_px:.4g}`\n"
+                    f"{result_emoji}"
+                )
                 try:
-                    a15 = _get_tv_analysis(asset, timeframe='15m')
-                    if a15:
-                        q15, _ = _assess_signal_quality(a15, direction, asset_type=asset_type)
-                        mtf_confirmed = 'FORTE' in q15 or 'MODERADO' in q15
+                    await context.bot.send_message(
+                        chat_id=chat_id, text=result_msg, parse_mode='Markdown'
+                    )
                 except Exception:
                     pass
+            _scan_pending_signal = {}
 
-                if crypto_profile and crypto_profile['require_mtf_for_all'] and not mtf_confirmed:
-                    logger.info(
-                        '[scan] bloqueado perfil cripto sem confirmacao 15m | %s %s tier=%s',
-                        asset,
-                        direction,
-                        crypto_profile['tier'],
-                    )
-                    rejection_stats['mtf_required'] += 1
-                    continue
+    # ── Monta lista de símbolos a varrer ─────────────────────────────────────
+    symbols_to_scan = list(monitored_symbols)
 
-                # Exige confirmação 15m para sinais fracos (<=5) e para qualquer contratendência.
-                min_score_without_mtf = 5
-                if crypto_profile:
-                    min_score_without_mtf = int(crypto_profile['min_score_without_mtf'])
-                if (score <= min_score_without_mtf or not trend_aligned) and not mtf_confirmed:
-                    logger.info('[scan] bloqueado sem confirmacao 15m | %s %s score=%s', asset, direction, score)
-                    rejection_stats['mtf_required'] += 1
-                    continue
+    # Adiciona externos que estiverem ativos (forex/commodities/ações)
+    forex_ok, _ = _is_forex_session_active()
+    if forex_ok:
+        forex_candidates = [s for s in EXTERNAL_FOREX if '/' in s and s == s.upper()][:6]
+        symbols_to_scan += forex_candidates
 
-                if SCAN_STRICT_NOISE_FILTER:
-                    is_noise, weak_flags = _is_noise_scan_candidate(reasons, score, mtf_confirmed)
-                    if is_noise:
-                        logger.info(
-                            '[scan] bloqueado ruido | %s %s score=%s weak=%s',
-                            asset,
-                            direction,
-                            score,
-                            ','.join(weak_flags) if weak_flags else 'n/a',
-                        )
-                        rejection_stats['noise_block'] += 1
-                        continue
+    best_signal  = None
+    best_score   = 0.0
 
-                sort_score = score + (0.5 if mtf_confirmed else 0)
-                candidates.append((sort_score, score, asset, direction, analysis, quality, reasons, mtf_confirmed))
-            except Exception:
+    # ── Varre cada ativo com ATLAS ───────────────────────────────────────────
+    for symbol in symbols_to_scan:
+        try:
+            # Cooldown por ativo+direção
+            last_buy  = _auto_scan_last_alerted.get(f"{symbol}_BUY", 0)
+            last_sell = _auto_scan_last_alerted.get(f"{symbol}_SELL", 0)
+            if now_ts - last_buy  < _AUTO_SCAN_COOLDOWN and                now_ts - last_sell < _AUTO_SCAN_COOLDOWN:
                 continue
 
-    if not candidates:
-        logger.info(
-            '[scan] sem candidatos | no_analysis=%s not_strong=%s rsi_block=%s mtf_block=%s profile_block=%s noise_block=%s',
-            rejection_stats['no_analysis'],
-            rejection_stats['not_strong'],
-            rejection_stats['rsi_stretched'],
-            rejection_stats['mtf_required'],
-            rejection_stats['profile_block'],
-            rejection_stats['noise_block'],
-        )
-        return
+            # ── Perfil do ativo (Tier) ───────────────────────────────────────
+            profile = get_asset_profile(symbol)
+            if profile.get('liquidity_check'):
+                sess_ok, sess_label = _is_forex_session_active()
+                if not sess_ok:
+                    logger.debug(f"[ATLAS-SCAN] {symbol} bloqueado — sessão: {sess_label}")
+                    continue
 
-    # Seleciona o melhor candidato respeitando cooldown por ativo+direção.
-    candidates.sort(reverse=True)
-    selected_candidate = None
-    for candidate in candidates:
-        _, cand_score, cand_asset, cand_direction, cand_analysis, cand_quality, cand_reasons, cand_mtf_confirmed = candidate
-        alert_key = f'{cand_asset}_{cand_direction}'
-        last_alert_ts = _auto_scan_last_alerted.get(alert_key, 0.0)
-        if now_ts - last_alert_ts < _AUTO_SCAN_COOLDOWN:
+            # ── Análise ATLAS (motor único) ──────────────────────────────────
+            tf = '1m'
+            tv_data = _get_tv_analysis(symbol, tf)
+            if not tv_data:
+                continue
+
+            close = tv_data.get('close', 0)
+            rsi   = tv_data.get('rsi', 50)
+            adx   = tv_data.get('adx', 0)
+
+            # ADX mínimo para o Tier
+            if adx < profile.get('min_adx', 20):
+                logger.debug(f"[ATLAS-SCAN] {symbol} ADX {adx:.1f} < {profile['min_adx']} — skip")
+                continue
+
+            # Análise de confluência ATLAS
+            analysis = _run_confluence_analysis(symbol, tv_data, tf)
+            if not analysis:
+                continue
+
+            score_pct    = analysis.get('score_pct', 0)
+            direction    = analysis.get('direction', 'NEUTRAL')
+            consensus    = analysis.get('consensus', 0)
+            has_transfer = analysis.get('has_transfer', False)
+
+            # Filtro de transferência (SMC)
+            transfer_bonus = has_transfer and analysis.get('scores', {}).get('smc', 0) >= 0.6
+
+            # Thresholds dinâmicos por timeframe e transferência
+            min_prob = (MIN_ALERT_PROBABILITY_1M - 3) if transfer_bonus else MIN_ALERT_PROBABILITY_1M
+            min_cons = max(1, MIN_SIGNAL_CONSENSUS_1M - (1 if transfer_bonus else 0))
+
+            if score_pct < min_prob:
+                logger.debug(f"[ATLAS-SCAN] {symbol} score {score_pct:.1f}% < {min_prob} — skip")
+                continue
+            if consensus < min_cons:
+                logger.debug(f"[ATLAS-SCAN] {symbol} consenso {consensus} < {min_cons} — skip")
+                continue
+            if direction == 'NEUTRAL':
+                continue
+
+            # Guarda o melhor sinal desta varredura
+            if score_pct > best_score:
+                best_score = score_pct
+                best_signal = {
+                    'symbol'    : symbol,
+                    'direction' : direction,
+                    'score_pct' : score_pct,
+                    'consensus' : consensus,
+                    'close'     : close,
+                    'rsi'       : rsi,
+                    'adx'       : adx,
+                    'analysis'  : analysis,
+                    'profile'   : profile,
+                    'transfer'  : has_transfer,
+                    'tf'        : tf,
+                }
+
+        except Exception as e:
+            logger.warning(f"[ATLAS-SCAN] Erro em {symbol}: {e}")
             continue
-        selected_candidate = (
-            cand_score,
-            cand_asset,
-            cand_direction,
-            cand_analysis,
-            cand_quality,
-            cand_reasons,
-            cand_mtf_confirmed,
-            alert_key,
-        )
-        break
 
-    if selected_candidate is None:
-        logger.info('[scan] candidatos em cooldown por ativo/direcao | total=%s cooldown_s=%s', len(candidates), _AUTO_SCAN_COOLDOWN)
+    if not best_signal:
+        logger.debug("[ATLAS-SCAN] Nenhum sinal ATLAS aprovado nesta varredura")
         return
 
-    score, asset, direction, analysis, quality, reasons, mtf_confirmed, selected_alert_key = selected_candidate
+    # ── Monta e envia mensagem ATLAS ─────────────────────────────────────────
+    sig        = best_signal
+    symbol     = sig['symbol']
+    direction  = sig['direction']
+    score_pct  = sig['score_pct']
+    consensus  = sig['consensus']
+    close      = sig['close']
+    rsi        = sig['rsi']
+    adx        = sig['adx']
+    analysis   = sig['analysis']
+    profile    = sig['profile']
+    has_tr     = sig['transfer']
 
-    # ── PASSO 5: construir e enviar o sinal ───────────────────────────────
-    market_symbol, _market_note = resolve_market_symbol(asset)
+    dir_label  = 'COMPRA' if direction == 'BUY' else 'VENDA'
+    dir_arrow  = '🟢' if direction == 'BUY' else '🔴'
+    tier_name  = profile.get('tier_name', '')
 
-    close = analysis.get('close')
-    rsi   = analysis.get('RSI')
-    group = _external_asset_group(asset)
-    direction_label = 'COMPRA' if direction == 'BUY' else 'VENDA'
-    direction_arrow = '🟢' if direction == 'BUY' else '🔴'
-    op_emoji = '📈' if direction == 'BUY' else '📉'
-    close_str = f'{close:.4g}' if close is not None else 'N/A'
-    rsi_str   = f'{rsi:.0f}'   if rsi   is not None else 'N/A'
-    reasons_text = '\n'.join(f'  {r}' for r in reasons)
-    mtf_tag = '✅ 5m + 15m confirmados' if mtf_confirmed else '⚠️ Apenas 5m confirmado'
-
-    # Próxima fronteira de 5 minutos
-    now_local = datetime.now()
-    total_min = now_local.minute + now_local.second / 60 + 0.02
-    next_5m_min = _math.ceil(total_min / 5) * 5
-    if next_5m_min >= 60:
-        entry_dt = now_local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    # Qualidade do sinal
+    if score_pct >= 65:
+        quality = 'FORTE 🎯'
+    elif score_pct >= 55:
+        quality = 'MODERADO'
     else:
-        entry_dt = now_local.replace(minute=next_5m_min, second=0, microsecond=0)
+        quality = 'FRACO ⚠️'
 
-    # Evita alertas tardios: exige janela mínima para o operador agir antes da entrada.
-    lead_seconds = (entry_dt - now_local).total_seconds()
-    if lead_seconds < SCAN_MIN_ENTRY_LEAD_SECONDS:
-        entry_dt = entry_dt + timedelta(minutes=5)
-
-    prot1_dt = entry_dt + timedelta(minutes=5)
-    prot2_dt = entry_dt + timedelta(minutes=10)
-    entry_str = entry_dt.strftime('%H:%M')
-    prot1_str = prot1_dt.strftime('%H:%M')
-    prot2_str = prot2_dt.strftime('%H:%M')
-
-    eco_block = ''
-    if upcoming_events:
-        evt_lines = '\n'.join(
-            f"  ⏰ {e.get('time','?')} — {e.get('event','?')} ({e.get('country','?')})"
-            for e in upcoming_events[:3]
-        )
-        eco_block = f"\n\n🚨 *ATENÇÃO — Evento macro em ≤ 30min:*\n{evt_lines}"
-
-    exec_block = ''
-    canonical = asset.upper()
-    bitget_symbol = BITGET_FUTURES_MAP.get(canonical)
-    trade_executed = False
-    if bitget_symbol and close:
-        can_execute = not upcoming_events  # MTF é informativo; não bloqueia simulador
-        if not can_execute:
-            exec_block = "\n\n⏸ _Execução pausada: evento macro ≤ 30min_"
+    # Breakdown por técnica
+    scores = analysis.get('scores', {})
+    breakdown_lines = []
+    tech_map = [
+        ('smc',       '🎯 SMC',       30),
+        ('wyckoff',   '📊 Wyckoff',   25),
+        ('price_action','🕯 Price Action',20),
+        ('traditional','📈 Tradicional',15),
+        ('elliott',   '🌊 Elliott',   10),
+    ]
+    for key, label, weight in tech_map:
+        s = scores.get(key, 0)
+        if s >= 0.6:
+            em = '✅'
+        elif s <= 0.4:
+            em = '❌'
         else:
-            result = _bx.execute_trade(
-                asset=canonical,
-                bitget_symbol=bitget_symbol,
-                direction=direction,
-                price=close,
-                rsi=rsi or 0.0,
-                quality=quality,
-            )
-            if result.get('ok'):
-                trade_executed = True
-                mode = result.get('mode', 'PAPER')
-                trade = result.get('trade', {})
-                qty   = trade.get('qty', result.get('qty', 0))
-                logger.info('[scan] execute_trade OK: %s %s %s qty=%.6g mode=%s', canonical, direction, bitget_symbol, qty, mode)
-                exec_block = (
-                    f"\n\n{'📋' if mode == 'PAPER' else '✅'} *Bitget {mode}:* "
-                    f"`{direction} {qty:.6g} {canonical}` @ `{close_str}`"
-                )
-            else:
-                logger.warning('[scan] execute_trade FALHOU: %s %s erro=%s', canonical, direction, result.get('error', 'erro'))
-                exec_block = f"\n\n⚠️ _Execução falhou: {result.get('error', 'erro')}_"
+            em = '⚪'
+        breakdown_lines.append(f"  {em} {label}: {s*100:.0f}%")
+    breakdown = '\n'.join(breakdown_lines)
 
-    interval_min = _SCAN_SIGNAL_INTERVAL // 60
-    
-    # Formata análise técnica compacta
-    tech_lines = []
-    tech_lines.append(f"💰 Preço: `{close_str}`")
-    tech_lines.append(f"📊 RSI: `{rsi_str}` | ADX: `{analysis.get('ADX', 0):.0f}`")
-    
-    # Mostra EMAs principais
-    ema9 = analysis.get('EMA9')
-    ema20 = analysis.get('EMA20')
-    if ema9 and close:
-        ema9_pct = ((close - ema9) / ema9) * 100
-        ema9_emoji = '🟢' if ema9_pct > 0 else '🔴'
-        tech_lines.append(f"{ema9_emoji} EMA9: `{ema9:.4g}` ({ema9_pct:+.2f}%)")
-    if ema20 and close:
-        ema20_pct = ((close - ema20) / ema20) * 100
-        ema20_emoji = '🟢' if ema20_pct > 0 else '🔴'
-        tech_lines.append(f"{ema20_emoji} EMA20: `{ema20:.4g}` ({ema20_pct:+.2f}%)")
-    
-    tech_block = '\n'.join(tech_lines)
-    
+    transfer_tag = '\n💧 *Liquidez detectada* (SMC)' if has_tr else ''
+
     msg = (
-        f"{direction_arrow} *SINAL DETECTADO — {quality}* 🎯\n\n"
-        f"📊 *ATIVO:* {asset} ({group})\n"
-        f"❗️ *ENTRADA:* `{entry_str}` (UTC-3)\n"
-        f"⏰ *TEMPO:* 5 MINUTOS\n"
-        f"{op_emoji} *OPERAÇÃO:* {direction_label}\n"
-        f"_{mtf_tag}_\n\n"
-        f"🚦 *PROTEÇÕES (se necessário):*\n"
-        f"  1ª: `{prot1_str}` | 2ª: `{prot2_str}`\n\n"
-        f"📈 *Análise Técnica:*\n"
-        f"{tech_block}"
-        f"{eco_block}"
-        f"{exec_block}\n\n"
-        f"_Resultado em ~5min | Próximo sinal em ~{interval_min}min após resultado_"
+        f"🚨 *SINAL ATLAS — {symbol}*\n"
+        f"📅 {_now_str()}\n\n"
+        f"{dir_arrow} *{dir_label}* — {quality}\n"
+        f"🎯 Score: `{score_pct:.0f}%` | Consenso: `{consensus}/5`\n"
+        f"🏷 Tier: {tier_name} | TF: {sig['tf'].upper()}\n\n"
+        f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n\n"
+        f"📊 *Breakdown ATLAS:*\n{breakdown}"
+        f"{transfer_tag}\n\n"
+        f"⚠️ _Sinal gerado por ATLAS — não é recomendação financeira_"
     )
+
     try:
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
-    except Exception:
+    except Exception as e:
+        logger.error(f"[ATLAS-SCAN] Erro ao enviar sinal: {e}")
         return
 
-    # ── PASSO 6: registrar sinal pendente para checagem de resultado ──────
-    entry_ts = entry_dt.timestamp()
+    # ── Registra sinal pendente e atualiza cooldowns ─────────────────────────
+    _auto_scan_last_alerted[f"{symbol}_{direction}"] = now_ts
+    _scan_last_signal_ts = now_ts
+
+    from datetime import datetime as _dt
+    now_local = _dt.now()
+    entry_ts  = now_local.timestamp() + 60  # entrada estimada em ~1min
+
     _scan_pending_signal = {
-        'asset': asset,
-        'market_symbol': market_symbol,
-        'direction': direction,
-        'entry_price': close,
-        'entry_ts': entry_ts,
-        'expiry_ts': entry_ts + 300,       # 5 min após ENTRADA para checar resultado
-        'pre_analysis_ts': entry_ts + 240, # 4 min após entrada → pré-análise P1
-        'pre_analysis_sent': False,
-        'quality': quality,
-        'executed': trade_executed,        # False = sem posição real na Bitget
+        'symbol'      : symbol,
+        'direction'   : direction,
+        'entry_price' : close,
+        'entry_ts'    : entry_ts,
+        'duration_s'  : 300,
     }
-    _auto_scan_last_alerted[selected_alert_key] = now_ts
+
+    # ── Execução Bitget (simulador / real) ───────────────────────────────────
+    if BITGET_EXECUTOR_ENABLED:
+        try:
+            side = 'buy' if direction == 'BUY' else 'sell'
+            result = await bitget_executor.place_order_async(
+                symbol=symbol,
+                side=side,
+                confidence=score_pct / 100,
+            )
+            if result:
+                exec_msg = f"✅ *Bitget:* ordem enviada (`{side.upper()}` {symbol})"
+            else:
+                exec_msg = f"⚠️ *Bitget:* ordem não confirmada"
+        except Exception as exc:
+            exec_msg = f"⚠️ *Bitget:* falha — `{exc}`"
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=exec_msg, parse_mode='Markdown'
+            )
+        except Exception:
+            pass
+
 
 
 async def bitget_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

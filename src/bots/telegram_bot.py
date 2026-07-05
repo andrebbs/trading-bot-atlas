@@ -301,6 +301,24 @@ def _env_flag(raw_value: str | None, default: bool = False) -> bool:
     return raw_value.strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
+DETAIL_REQUEST_TOKENS = {'detalhe', 'detalhes', 'detail', 'details', 'full', 'completo'}
+
+
+def _split_analysis_args(args: list[str] | None) -> tuple[bool, list[str]]:
+    """Separa flag de detalhe dos demais argumentos de análise."""
+    detail_requested = False
+    cleaned_args: list[str] = []
+
+    for raw_arg in args or []:
+        normalized = str(raw_arg or '').strip().lower()
+        if normalized in DETAIL_REQUEST_TOKENS:
+            detail_requested = True
+            continue
+        cleaned_args.append(raw_arg)
+
+    return detail_requested, cleaned_args
+
+
 # Configuração de logging
 LOGS_DIR = PROJECT_ROOT / 'logs'
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2154,7 +2172,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     main_section = """
 📊 **Análise:**
-/analise - Análise completa do ativo atual
+/analise - Resumo rápido do ativo atual
+/analise detalhes - Mostra a justificativa completa
 /btc - Análise do Bitcoin (BTC/USDT)
 /eth - Análise do Ethereum (ETH/USDT)
 /sol - Análise do Solana (SOL/USDT)
@@ -2243,7 +2262,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=None, timeframe=None):
+async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=None, timeframe=None, detailed: bool = False):
     """Análise avulsa usando sistema ATLAS (5 técnicas com confluência)."""
     current_symbol = (symbol or config.SYMBOL).upper()
     current_timeframe = _resolve_analysis_timeframe(timeframe)
@@ -2478,50 +2497,71 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
 
         # ── Mensagem principal ──────────────────────────────────
         transfer_tag = ' 💧Liquidez' if has_transfer else ''
-        message = (
-            f"🔥 *ANÁLISE ATLAS — {current_symbol}*\n"
-            f"📅 {now_local.strftime('%d/%m/%Y %H:%M:%S')}\n"
-            f"⏱ Timeframe: `{current_timeframe}`\n"
-            f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n"
-            f"📉 Stoch K/D: `{stoch_k:.1f}/{stoch_d:.1f}`\n\n"
-            f"{rec_emoji} *RECOMENDAÇÃO: {dir_label} — {strength}*{transfer_tag}\n"
-            f"🎯 Score de Confluência: *{score_pct}%* (bruto: {raw_score_pct}%)\n"
-            f"🧪 Classificação ATLAS: *{recommendation_display}*\n"
-            f"✅ Consenso: *{confluence}/5 técnicas* concordam\n\n"
-            f"{confluence_emoji} *Confluência Operacional: {confluence_label}*\n"
-            f"✅ A favor: *{factors_pro}* | ❌ Contra: *{factors_contra}* | ⚪ Neutras: *{factors_neutral}*\n\n"
-            f"📊 *Breakdown por Técnica:*\n"
-            f"{breakdown_text}\n\n"
-            f"🧭 *Direção por Técnica:*\n"
-            f"{directional_text}\n\n"
-            f"ℹ️ Pesos (30%, 25%...) representam importância no modelo, não probabilidade de acerto.\n\n"
-        )
+        short_recommendation = f"{rec_emoji} *RECOMENDAÇÃO: {dir_label} — {strength}*{transfer_tag}"
 
-        if not is_weak:
-            message += f"❗️ Entrada sugerida: `{entry_str}` UTC-3 | Expiração: {expiry_label}\n"
+        if detailed:
+            message = (
+                f"🔥 *ANÁLISE ATLAS — {current_symbol}*\n"
+                f"📅 {now_local.strftime('%d/%m/%Y %H:%M:%S')}\n"
+                f"⏱ Timeframe: `{current_timeframe}`\n"
+                f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n"
+                f"📉 Stoch K/D: `{stoch_k:.1f}/{stoch_d:.1f}`\n\n"
+                f"{short_recommendation}\n"
+                f"🎯 Score de Confluência: *{score_pct}%* (bruto: {raw_score_pct}%)\n"
+                f"🧪 Classificação ATLAS: *{recommendation_display}*\n"
+                f"✅ Consenso: *{confluence}/5 técnicas* concordam\n\n"
+                f"{confluence_emoji} *Confluência Operacional: {confluence_label}*\n"
+                f"✅ A favor: *{factors_pro}* | ❌ Contra: *{factors_contra}* | ⚪ Neutras: *{factors_neutral}*\n\n"
+                f"📊 *Breakdown por Técnica:*\n"
+                f"{breakdown_text}\n\n"
+                f"🧭 *Direção por Técnica:*\n"
+                f"{directional_text}\n\n"
+                f"ℹ️ Pesos (30%, 25%...) representam importância no modelo, não probabilidade de acerto.\n\n"
+            )
 
-        # ── Viés tático scalp ───────────────────────────────────
-        tactical_lines = []
-        if adx < 15:
-            bullish_t = stoch_k > stoch_d and stoch_k < 35 and close >= ema9
-            bearish_t = stoch_k < stoch_d and stoch_k > 65 and close <= ema9
-            if bullish_t:
-                tactical_lines.append("🟢 *Viés tático (scalp):* compra de curto prazo possível")
-                tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para cima em região descontada")
-            elif bearish_t:
-                tactical_lines.append("🔴 *Viés tático (scalp):* venda de curto prazo possível")
-                tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para baixo em região esticada")
+            if not is_weak:
+                message += f"❗️ Entrada sugerida: `{entry_str}` UTC-3 | Expiração: {expiry_label}\n"
 
-        if tactical_lines:
-            message += "\n" + "\n".join(tactical_lines) + "\n"
+            # ── Viés tático scalp ───────────────────────────────
+            tactical_lines = []
+            if adx < 15:
+                bullish_t = stoch_k > stoch_d and stoch_k < 35 and close >= ema9
+                bearish_t = stoch_k < stoch_d and stoch_k > 65 and close <= ema9
+                if bullish_t:
+                    tactical_lines.append("🟢 *Viés tático (scalp):* compra de curto prazo possível")
+                    tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para cima em região descontada")
+                elif bearish_t:
+                    tactical_lines.append("🔴 *Viés tático (scalp):* venda de curto prazo possível")
+                    tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para baixo em região esticada")
 
-        if is_weak:
-            if recommendation_raw.startswith('WEAK_'):
-                message += "\n⚠️ *Atenção:* Sinal fraco (WEAK) — sem entrada recomendada"
-            elif score_pct < 48:
-                message += "\n⚠️ *Atenção:* Score baixo — aguarde configuração mais clara"
-            elif confluence < 2:
-                message += f"\n⚠️ *Atenção:* Apenas {confluence}/5 técnicas concordam — sinal fraco"
+            if tactical_lines:
+                message += "\n" + "\n".join(tactical_lines) + "\n"
+
+            if is_weak:
+                if recommendation_raw.startswith('WEAK_'):
+                    message += "\n⚠️ *Atenção:* Sinal fraco (WEAK) — sem entrada recomendada"
+                elif score_pct < 48:
+                    message += "\n⚠️ *Atenção:* Score baixo — aguarde configuração mais clara"
+                elif confluence < 2:
+                    message += f"\n⚠️ *Atenção:* Apenas {confluence}/5 técnicas concordam — sinal fraco"
+        else:
+            message = (
+                f"🔥 *ANÁLISE ATLAS — {current_symbol}*\n"
+                f"📅 {now_local.strftime('%d/%m/%Y %H:%M:%S')}\n"
+                f"⏱ Timeframe: `{current_timeframe}`\n"
+                f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n\n"
+                f"{short_recommendation}\n"
+                f"🎯 Score de Confluência: *{score_pct}%*\n"
+                f"🧪 Classificação ATLAS: *{recommendation_display}*\n"
+                f"✅ Consenso: *{confluence}/5 técnicas* | {confluence_emoji} *{confluence_label}*\n"
+                f"📌 Envie `/analise detalhes {current_symbol} {current_timeframe}` para ver a justificativa completa.\n"
+            )
+
+            if not is_weak:
+                message += f"❗️ Entrada sugerida: `{entry_str}` UTC-3 | Expiração: {expiry_label}\n"
+
+            if is_weak:
+                message += "\n⚠️ *Atenção:* sinal fraco — aguarde configuração mais clara"
 
         await update.message.reply_text(message, parse_mode='Markdown')
 
@@ -2534,9 +2574,13 @@ async def analise_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /analise"""
     symbol = None
     timeframe = None
+    detailed = False
 
-    if context.args:
-        raw_symbol = (context.args[0] or '').strip().upper().replace('-', '/').replace(' ', '')
+    detail_requested, args = _split_analysis_args(list(getattr(context, 'args', []) or []))
+    detailed = detail_requested
+
+    if args:
+        raw_symbol = (args[0] or '').strip().upper().replace('-', '/').replace(' ', '')
         alias_map = {
             'BTC': 'BTC/USDT',
             'ETH': 'ETH/USDT',
@@ -2559,10 +2603,10 @@ async def analise_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 symbol = raw_symbol if '/' in raw_symbol else f'{raw_symbol}/USDT'
 
-        if len(context.args) > 1:
-            timeframe = (context.args[1] or '').strip().lower()
+        if len(args) > 1:
+            timeframe = (args[1] or '').strip().lower()
 
-    await analyze(update, context, symbol=symbol, timeframe=timeframe)
+    await analyze(update, context, symbol=symbol, timeframe=timeframe, detailed=detailed)
 
 
 async def _analyze_quick_symbol(
@@ -2572,8 +2616,12 @@ async def _analyze_quick_symbol(
 ):
     """Atalhos de ativo aceitam timeframe opcional: /eth 1m, /btc 5m, etc."""
     timeframe = None
-    if context.args:
-        candidate_tf = (context.args[0] or '').strip().lower()
+    detailed = False
+    detail_requested, args = _split_analysis_args(list(getattr(context, 'args', []) or []))
+    detailed = detail_requested
+
+    if args:
+        candidate_tf = (args[0] or '').strip().lower()
         if candidate_tf in SUPPORTED_TIMEFRAMES:
             timeframe = candidate_tf
         else:
@@ -2583,7 +2631,7 @@ async def _analyze_quick_symbol(
             )
             return
 
-    await analyze(update, context, symbol=symbol, timeframe=timeframe)
+    await analyze(update, context, symbol=symbol, timeframe=timeframe, detailed=detailed)
 
 
 async def btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4080,28 +4128,7 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
     else:
         quality = 'FRACO ⚠️'
 
-    # Breakdown por técnica
-    scores = analysis.get('scores', {})
-    breakdown_lines = []
-    tech_map = [
-        ('smc',       '🎯 SMC',       30),
-        ('wyckoff',   '📊 Wyckoff',   25),
-        ('price_action','🕯 Price Action',20),
-        ('traditional','📈 Tradicional',15),
-        ('elliott',   '🌊 Elliott',   10),
-    ]
-    for key, label, weight in tech_map:
-        s = scores.get(key, 0)
-        if s >= 0.6:
-            em = '✅'
-        elif s <= 0.4:
-            em = '❌'
-        else:
-            em = '⚪'
-        breakdown_lines.append(f"  {em} {label}: {s*100:.0f}%")
-    breakdown = '\n'.join(breakdown_lines)
-
-    transfer_tag = '\n💧 *Liquidez detectada* (SMC)' if has_tr else ''
+    transfer_note = '💧 Liquidez detectada (SMC)\n\n' if has_tr else ''
 
     msg = (
         f"🚨 *SINAL ATLAS — {symbol}*\n"
@@ -4110,8 +4137,8 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
         f"🎯 Score: `{score_pct:.0f}%` | Consenso: `{consensus}/5`\n"
         f"🏷 Tier: {tier_name} | TF: {sig['tf'].upper()}\n\n"
         f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n\n"
-        f"📊 *Breakdown ATLAS:*\n{breakdown}"
-        f"{transfer_tag}\n\n"
+        f"{transfer_note}"
+        f"📌 Para ver a justificativa completa, use `/analise detalhes {symbol} {sig['tf'].lower()}`\n\n"
         f"⚠️ _Sinal gerado por ATLAS — não é recomendação financeira_"
     )
 

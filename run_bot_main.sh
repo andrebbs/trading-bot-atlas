@@ -11,6 +11,8 @@ export BOT_INSTANCE_NAME="${BOT_INSTANCE_NAME:-main}"
 export MARKET_TYPE="${MARKET_TYPE:-crypto_binary}"
 # Limite de sinais por ciclo de monitoramento (ajuste aqui se quiser mais/menos sinais).
 export MONITOR_MAX_SIGNALS="${MONITOR_MAX_SIGNALS:-8}"
+export MONITOR_AUTO_START="${MONITOR_AUTO_START:-1}"
+export MONITOR_CONTINUOUS_MODE="${MONITOR_CONTINUOUS_MODE:-1}"
 
 choose_python() {
   local candidates=(

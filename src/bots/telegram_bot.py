@@ -556,6 +556,7 @@ if _saved_tf and _saved_tf in SUPPORTED_TIMEFRAMES:
 MONITOR_INTERVAL_SECONDS = 5
 MONITOR_DURATION_MINUTES = _env_int('MONITOR_DURATION_MINUTES', 60, min_value=5)
 MONITOR_MAX_SIGNALS = _env_int('MONITOR_MAX_SIGNALS', 4)
+MONITOR_CONTINUOUS_MODE = _env_flag(get_profile_env('MONITOR_CONTINUOUS_MODE'), default=True)
 MONITOR_NEW_SIGNAL_CYCLE_MINUTES = _env_int('MONITOR_NEW_SIGNAL_CYCLE_MINUTES', 5)
 MONITOR_PRE_ALERT_MAX_SECONDS = 20
 MONITOR_PRE_ALERT_MIN_SECONDS = 10
@@ -2157,30 +2158,37 @@ def get_telegram_bot_token():
 
 def bootstrap_auto_monitoring() -> tuple[bool, str | None]:
     """Ativa o monitoramento no boot quando solicitado por ambiente."""
+    if not MONITOR_AUTO_START:
+        return False, None
+
+    chat_id = get_telegram_chat_id()
+    return start_monitoring_session(chat_id=chat_id)
+
+
+def start_monitoring_session(chat_id: str | int | None = None) -> tuple[bool, str | None]:
+    """Ativa o monitor principal de sinais e reseta estado de sessão."""
     global monitoring_active, monitor_end_time, monitor_signals_sent, current_rotation_index
     global pending_signal_evaluations, pending_martingale_decisions, last_pre_alert_key, last_direction_alert_at
     global monitor_target_chat_id, monitor_started_at, monitor_last_alert_at, monitor_last_heartbeat_at
     global monitor_session_results, last_fresh_alert_at, monitor_duration_minutes
 
-    if not MONITOR_AUTO_START:
-        return False, None
-
-    chat_id = get_telegram_chat_id()
-    if not chat_id:
+    target_chat_id = chat_id or get_telegram_chat_id()
+    if not target_chat_id:
         return False, 'TELEGRAM_CHAT_ID ausente'
 
     if not monitored_symbols:
         return False, 'nenhum ativo configurado para monitoramento'
 
+    now = datetime.now()
     monitor_duration_minutes = MONITOR_DURATION_MINUTES
     monitoring_active = True
-    monitor_end_time = datetime.now() + timedelta(minutes=monitor_duration_minutes)
+    monitor_end_time = None if MONITOR_CONTINUOUS_MODE else now + timedelta(minutes=monitor_duration_minutes)
     monitor_signals_sent = 0
     current_rotation_index = 0
-    monitor_target_chat_id = chat_id
-    monitor_started_at = datetime.now()
+    monitor_target_chat_id = target_chat_id
+    monitor_started_at = now
     monitor_last_alert_at = None
-    monitor_last_heartbeat_at = datetime.now()
+    monitor_last_heartbeat_at = now
     pending_signal_evaluations = []
     pending_martingale_decisions = []
     monitor_session_results = []
@@ -2191,9 +2199,35 @@ def bootstrap_auto_monitoring() -> tuple[bool, str | None]:
     return True, None
 
 
+def stop_monitoring_session() -> None:
+    """Desativa o monitor principal e limpa estado efêmero da sessão."""
+    global monitoring_active, monitor_end_time, monitor_target_chat_id, monitor_started_at
+    global monitor_last_alert_at, monitor_last_heartbeat_at
+
+    monitoring_active = False
+    monitor_end_time = None
+    monitor_target_chat_id = None
+    monitor_started_at = None
+    monitor_last_alert_at = None
+    monitor_last_heartbeat_at = None
+
+
+def roll_monitor_cycle(now: datetime) -> None:
+    """Renova ciclo do monitor sem desligar, evitando paradas silenciosas."""
+    global monitor_end_time, monitor_signals_sent, monitor_started_at, monitor_last_heartbeat_at
+
+    monitor_signals_sent = 0
+    monitor_started_at = now
+    monitor_last_heartbeat_at = now
+    if MONITOR_CONTINUOUS_MODE:
+        monitor_end_time = None
+    else:
+        monitor_end_time = now + timedelta(minutes=monitor_duration_minutes)
+
+
 async def notify_auto_monitor_started(context: ContextTypes.DEFAULT_TYPE):
     """Envia confirmação de auto-start para o chat alvo."""
-    if not _auto_scan_active:
+    if not monitoring_active:
         return
 
     chat_id = monitor_target_chat_id or get_telegram_chat_id()
@@ -2213,7 +2247,8 @@ async def notify_auto_monitor_started(context: ContextTypes.DEFAULT_TYPE):
         chat_id=chat_id,
         text=(
             "🤖 *abbsCrypto iniciado*\n\n"
-            "📡 *Scanner automático ATIVO*\n"
+            f"📡 *Scanner automático:* {'ATIVO' if _auto_scan_active else 'INATIVO'}\n"
+            f"🎯 *Monitor principal:* {'ATIVO' if monitoring_active else 'INATIVO'}\n"
             f"🔬 Engine: TradingView API — 5m + 15m\n"
             f"🧭 Modo operacional: *{mode_label}*\n"
             f"🚦 Filtro de qualidade: sinais fortes + confirmação de contexto\n"
@@ -2878,6 +2913,11 @@ async def timeframe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     tf = (context.args[0] or '').strip().lower()
+    monitor_status_line = (
+        "🟢 Monitor já está ativo para emissão de alertas."
+        if monitoring_active
+        else "⚠️ Monitor está desligado. Use /monitor on para receber sinais automáticos."
+    )
 
     if tf == 'auto':
         monitor_timeframe_mode = 'dynamic'
@@ -2885,7 +2925,8 @@ async def timeframe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "✅ Timeframe dinâmico profissional ativado.\n\n"
             f"🧠 Pool profissional: {', '.join(monitor_dynamic_timeframes)}\n"
-            "O monitor vai priorizar a melhor entrada entre os tempos elegíveis e usar filtro operacional mais rígido.",
+            "O monitor vai priorizar a melhor entrada entre os tempos elegíveis e usar filtro operacional mais rígido.\n"
+            f"{monitor_status_line}",
             parse_mode='Markdown'
         )
         return
@@ -2914,7 +2955,7 @@ async def timeframe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Timeframe alterado para: **{tf}**\n\n"
         f"{style_msg.get(tf, '')}\n\n"
-        "💡 Dica: Use /monitor on para alertas automáticos",
+        f"{monitor_status_line}",
         parse_mode='Markdown'
     )
 
@@ -3042,6 +3083,7 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── STATUS ────────────────────────────────────────────────────────────
     if not arg:
         status_icon = '🟢 ATIVO' if _auto_scan_active else '🔴 INATIVO'
+        monitor_loop_status = '🟢 ATIVO' if monitoring_active else '🔴 INATIVO'
         cooldown_info = ''
         if _auto_scan_active and _scan_last_signal_ts:
             elapsed = int(time.time() - _scan_last_signal_ts)
@@ -3066,7 +3108,8 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await _reply_text(
             update,
-            f"📡 *Scanner automático: {status_icon}*{cooldown_info}{pending_info}\n\n"
+            f"📡 *Scanner automático: {status_icon}*{cooldown_info}{pending_info}\n"
+            f"🎯 *Monitor principal de sinais: {monitor_loop_status}*\n\n"
             f"🔥 *Engine:* ATLAS — Sistema de Confluência (5 técnicas)\n"
             f"📊 *Técnicas:* SMC (30%), Wyckoff (25%), Price Action (20%), Tradicional (15%), Elliott (10%)\n"
             f"🎯 *Consenso:* ≥ 2/5 técnicas + Score ≥ 48% (modo agressivo)\n"
@@ -3086,6 +3129,8 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── LIGAR ─────────────────────────────────────────────────────────────
     if arg in ('on', 'ativar', 'ligar', '1'):
         _auto_scan_active = True
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        started, start_reason = start_monitoring_session(chat_id=chat_id)
         
         # Separa crypto real (com tier) de outros ativos
         crypto_tier1 = sorted(CRYPTO_TIER1_SYMBOLS)
@@ -3098,6 +3143,12 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         forex_status = f'✅ {forex_label}' if forex_session_ok else f'🔒 Fora de sessão ({forex_label})'
         interval_min = _SCAN_SIGNAL_INTERVAL // 60
         
+        monitor_status_note = (
+            "✅ Monitor principal de sinais ativado."
+            if started
+            else f"⚠️ Monitor principal não iniciou: {start_reason}."
+        )
+
         await _reply_text(
             update,
             "✅ *Scanner ATIVADO*\n\n"
@@ -3115,13 +3166,16 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  🔴 TIER 3: {', '.join(crypto_tier3)}\n\n"
             f"💱 *Forex ({len(assets_forex)} pares):* {forex_status}\n\n"
             f"⏱ Varredura: cada 5 min | Cooldown: {interval_min} min entre sinais\n\n"
+            f"{monitor_status_note}\n"
+            f"🔁 Modo contínuo: {'ligado' if MONITOR_CONTINUOUS_MODE else 'desligado'}\n\n"
             "_O bot avisará automaticamente quando encontrar sinal qualificado._"
         )
 
     # ── DESLIGAR ──────────────────────────────────────────────────────────
     elif arg in ('off', 'desativar', 'desligar', '0'):
         _auto_scan_active = False
-        await _reply_text(update, "⏹ *Scanner DESATIVADO.*\nUse `/monitor on` para reativar.")
+        stop_monitoring_session()
+        await _reply_text(update, "⏹ *Scanner DESATIVADO.*\n⏹ *Monitor principal de sinais DESATIVADO.*\nUse `/monitor on` para reativar.")
 
     else:
         await _reply_text(update, "❌ Use: `/monitor on` | `/monitor off` | `/monitor` (status)")
@@ -4490,61 +4544,77 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
     chat_id = monitor_target_chat_id or get_telegram_chat_id()
     now = datetime.now()
 
-    # Desativa monitoramento automaticamente ao fim da janela configurada.
+    # Em modo contínuo, renova o ciclo automaticamente para evitar parada silenciosa.
     if monitor_end_time and now >= monitor_end_time:
-        session_summary = build_monitor_session_summary('tempo máximo atingido')
-        monitoring_active = False
-        monitor_end_time = None
-        monitor_target_chat_id = None
-        monitor_started_at = None
-        monitor_last_alert_at = None
-        monitor_last_heartbeat_at = None
-        if chat_id:
-            await _safe_send_message(
-                context.bot,
-                chat_id=chat_id,
-                text=session_summary,
-                parse_mode='Markdown'
-            )
-            await _safe_send_message(
-                context.bot,
-                chat_id=chat_id,
-                text=(
-                    "⏹ **Monitoramento finalizado automaticamente**\n\n"
-                    f"Duração máxima de {monitor_duration_minutes} minutos atingida.\n"
-                    "Use /monitor on para iniciar um novo ciclo."
-                ),
-                parse_mode='Markdown'
-            )
-        return
+        if MONITOR_CONTINUOUS_MODE:
+            roll_monitor_cycle(now)
+            if chat_id:
+                await _safe_send_message(
+                    context.bot,
+                    chat_id=chat_id,
+                    text=(
+                        "🔁 Monitor contínuo: novo ciclo iniciado automaticamente\n\n"
+                        f"Duração alvo por ciclo: {monitor_duration_minutes} minutos."
+                    ),
+                    parse_mode='Markdown'
+                )
+        else:
+            session_summary = build_monitor_session_summary('tempo máximo atingido')
+            stop_monitoring_session()
+            if chat_id:
+                await _safe_send_message(
+                    context.bot,
+                    chat_id=chat_id,
+                    text=session_summary,
+                    parse_mode='Markdown'
+                )
+                await _safe_send_message(
+                    context.bot,
+                    chat_id=chat_id,
+                    text=(
+                        "⏹ **Monitoramento finalizado automaticamente**\n\n"
+                        f"Duração máxima de {monitor_duration_minutes} minutos atingida.\n"
+                        "Use /monitor on para iniciar um novo ciclo."
+                    ),
+                    parse_mode='Markdown'
+                )
+            return
 
-    # Encerra sessão ao atingir limite e sem avaliações pendentes.
+    # Em modo contínuo, reinicia contagem de sessão ao atingir limite sem avaliações pendentes.
     if monitor_signals_sent >= MONITOR_MAX_SIGNALS and not pending_signal_evaluations:
-        session_summary = build_monitor_session_summary('limite de sinais atingido')
-        monitoring_active = False
-        monitor_end_time = None
-        monitor_target_chat_id = None
-        monitor_started_at = None
-        monitor_last_alert_at = None
-        monitor_last_heartbeat_at = None
-        if chat_id:
-            await _safe_send_message(
-                context.bot,
-                chat_id=chat_id,
-                text=session_summary,
-                parse_mode='Markdown'
-            )
-            await _safe_send_message(
-                context.bot,
-                chat_id=chat_id,
-                text=(
-                    "⏹ **Monitoramento finalizado automaticamente**\n\n"
-                    f"Limite de {MONITOR_MAX_SIGNALS} sinais atingido.\n"
-                    "Use /monitor on para iniciar um novo ciclo."
-                ),
-                parse_mode='Markdown'
-            )
-        return
+        if MONITOR_CONTINUOUS_MODE:
+            roll_monitor_cycle(now)
+            if chat_id:
+                await _safe_send_message(
+                    context.bot,
+                    chat_id=chat_id,
+                    text=(
+                        "🔁 Monitor contínuo: limite de sinais do ciclo atingido\n\n"
+                        f"Novo ciclo iniciado automaticamente (limite por ciclo: {MONITOR_MAX_SIGNALS})."
+                    ),
+                    parse_mode='Markdown'
+                )
+        else:
+            session_summary = build_monitor_session_summary('limite de sinais atingido')
+            stop_monitoring_session()
+            if chat_id:
+                await _safe_send_message(
+                    context.bot,
+                    chat_id=chat_id,
+                    text=session_summary,
+                    parse_mode='Markdown'
+                )
+                await _safe_send_message(
+                    context.bot,
+                    chat_id=chat_id,
+                    text=(
+                        "⏹ **Monitoramento finalizado automaticamente**\n\n"
+                        f"Limite de {MONITOR_MAX_SIGNALS} sinais atingido.\n"
+                        "Use /monitor on para iniciar um novo ciclo."
+                    ),
+                    parse_mode='Markdown'
+                )
+            return
     
     # Avalia sinais pendentes primeiro
     remaining_evaluations = []
@@ -5366,23 +5436,31 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
         )
 
         if monitor_signals_sent >= MONITOR_MAX_SIGNALS and not pending_signal_evaluations:
-            monitoring_active = False
-            monitor_end_time = None
-            monitor_target_chat_id = None
-            monitor_started_at = None
-            monitor_last_alert_at = None
-            monitor_last_heartbeat_at = None
-            if chat_id:
-                await _safe_send_message(
-                    context.bot,
-                    chat_id=chat_id,
-                    text=(
-                        "⏹ **Monitoramento finalizado automaticamente**\n\n"
-                        f"Limite de {MONITOR_MAX_SIGNALS} sinais atingido.\n"
-                        "Use /monitor on para iniciar um novo ciclo."
-                    ),
-                    parse_mode='Markdown'
-                )
+            if MONITOR_CONTINUOUS_MODE:
+                roll_monitor_cycle(now)
+                if chat_id:
+                    await _safe_send_message(
+                        context.bot,
+                        chat_id=chat_id,
+                        text=(
+                            "🔁 Monitor contínuo: limite de sinais do ciclo atingido\n\n"
+                            f"Novo ciclo iniciado automaticamente (limite por ciclo: {MONITOR_MAX_SIGNALS})."
+                        ),
+                        parse_mode='Markdown'
+                    )
+            else:
+                stop_monitoring_session()
+                if chat_id:
+                    await _safe_send_message(
+                        context.bot,
+                        chat_id=chat_id,
+                        text=(
+                            "⏹ **Monitoramento finalizado automaticamente**\n\n"
+                            f"Limite de {MONITOR_MAX_SIGNALS} sinais atingido.\n"
+                            "Use /monitor on para iniciar um novo ciclo."
+                        ),
+                        parse_mode='Markdown'
+                    )
     elif chat_id and MONITOR_HEARTBEAT_SECONDS > 0:
         should_send_heartbeat = False
         if monitor_last_heartbeat_at is None:

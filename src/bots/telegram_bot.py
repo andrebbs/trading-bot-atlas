@@ -96,7 +96,7 @@ async def atlas_scanner_job(context) -> None:
     for symbol in list(SCANNER_STATE.get("symbols", [])):
         result = _run_confluence_analysis(symbol, SCANNER_STATE.get("timeframe", "5m"))
         if _scanner_should_alert(result) and chat_id:
-            await context.bot.send_message(chat_id=chat_id, text=_format_scanner_alert(result))
+            await _safe_send_message(context.bot, chat_id=chat_id, text=_format_scanner_alert(result))
 
 async def scanner_command(update, context):
     args = [a.lower() for a in getattr(context, "args", [])]
@@ -154,6 +154,7 @@ import sys
 import os
 import json
 import logging
+import asyncio
 import time
 import re
 import requests
@@ -165,6 +166,7 @@ import fcntl
 import numpy as np
 import pandas as pd
 from telegram import Update
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -332,6 +334,110 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+_telegram_log_throttle = {}
+TELEGRAM_SEND_MAX_ATTEMPTS = max(1, int(os.getenv('TELEGRAM_SEND_MAX_ATTEMPTS', '4')))
+TELEGRAM_SEND_BACKOFF_SECONDS = max(0.5, float(os.getenv('TELEGRAM_SEND_BACKOFF_SECONDS', '1.5')))
+TELEGRAM_SEND_BACKOFF_MAX_SECONDS = max(2.0, float(os.getenv('TELEGRAM_SEND_BACKOFF_MAX_SECONDS', '20')))
+
+
+def _is_transient_telegram_error(exc: Exception) -> bool:
+    if isinstance(exc, (NetworkError, TimedOut, RetryAfter)):
+        return True
+
+    msg = str(exc).lower()
+    transient_markers = (
+        'temporary failure in name resolution',
+        'name resolution',
+        'network is unreachable',
+        'connection reset',
+        'server disconnected',
+        'timed out',
+        'timeout',
+        'bad gateway',
+        'service unavailable',
+    )
+    return any(marker in msg for marker in transient_markers)
+
+
+def _log_telegram_throttled(level: int, key: str, message: str, *args) -> None:
+    now_ts = time.time()
+    last_ts = _telegram_log_throttle.get(key, 0.0)
+    if now_ts - last_ts < 60:
+        return
+    _telegram_log_throttle[key] = now_ts
+    logger.log(level, message, *args)
+
+
+async def _safe_send_message(bot, chat_id, text: str, **kwargs) -> bool:
+    last_exc = None
+
+    for attempt in range(1, TELEGRAM_SEND_MAX_ATTEMPTS + 1):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            return True
+        except RetryAfter as exc:
+            last_exc = exc
+            wait_seconds = float(getattr(exc, 'retry_after', TELEGRAM_SEND_BACKOFF_SECONDS))
+            wait_seconds = max(1.0, min(wait_seconds, TELEGRAM_SEND_BACKOFF_MAX_SECONDS))
+            _log_telegram_throttled(
+                logging.WARNING,
+                'retry_after',
+                'Telegram rate limit/retry-after. attempt=%s/%s wait=%.1fs',
+                attempt,
+                TELEGRAM_SEND_MAX_ATTEMPTS,
+                wait_seconds,
+            )
+            if attempt >= TELEGRAM_SEND_MAX_ATTEMPTS:
+                break
+            await asyncio.sleep(wait_seconds)
+        except TelegramError as exc:
+            last_exc = exc
+            if not _is_transient_telegram_error(exc) or attempt >= TELEGRAM_SEND_MAX_ATTEMPTS:
+                break
+            wait_seconds = min(
+                TELEGRAM_SEND_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+                TELEGRAM_SEND_BACKOFF_MAX_SECONDS,
+            )
+            _log_telegram_throttled(
+                logging.WARNING,
+                'telegram_transient_error',
+                'Falha transitória ao enviar Telegram. attempt=%s/%s wait=%.1fs err=%s',
+                attempt,
+                TELEGRAM_SEND_MAX_ATTEMPTS,
+                wait_seconds,
+                exc,
+            )
+            await asyncio.sleep(wait_seconds)
+        except Exception as exc:
+            last_exc = exc
+            break
+
+    _log_telegram_throttled(
+        logging.ERROR,
+        'telegram_send_final_error',
+        'Falha definitiva ao enviar mensagem Telegram apos %s tentativas. err=%s',
+        TELEGRAM_SEND_MAX_ATTEMPTS,
+        last_exc,
+    )
+    return False
+
+
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = getattr(context, 'error', None)
+    if err is None:
+        return
+
+    if isinstance(err, TelegramError) and _is_transient_telegram_error(err):
+        _log_telegram_throttled(
+            logging.WARNING,
+            'telegram_handler_transient',
+            'Erro transitório no Telegram tratado pelo handler global: %s',
+            err,
+        )
+        return
+
+    logger.exception('Erro não tratado no loop do Telegram: %s', err)
 
 DIAGNOSTICS_LOG_PATH = LOGS_DIR / f'market_diagnostics_{BOT_PROFILE}.log'
 diagnostics_logger = logging.getLogger(f'{__name__}.market_diagnostics')
@@ -2102,7 +2208,8 @@ async def notify_auto_monitor_started(context: ContextTypes.DEFAULT_TYPE):
     forex_status = f'✅ {forex_label}' if forex_session_ok else f'🔒 Fora de sessão ({forex_label})'
     interval_min = _SCAN_SIGNAL_INTERVAL // 60
 
-    await context.bot.send_message(
+    await _safe_send_message(
+        context.bot,
         chat_id=chat_id,
         text=(
             "🤖 *abbsCrypto iniciado*\n\n"
@@ -3873,7 +3980,7 @@ async def externo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_text(update, "❌ Nao encontrei chat alvo para envio.")
         return
 
-    await context.bot.send_message(chat_id=target_chat_id, text=msg, parse_mode='Markdown')
+    await _safe_send_message(context.bot, chat_id=target_chat_id, text=msg, parse_mode='Markdown')
 
     if update.effective_chat and str(update.effective_chat.id) != str(target_chat_id):
         await _reply_text(update, f"✅ Sinal externo registrado e enviado.")
@@ -3947,7 +4054,7 @@ async def check_paper_trades(context: ContextTypes.DEFAULT_TYPE):
                 f"Entry: `{t['price']:.4g}` → Exit: `{t.get('exit_price', 0):.4g}`\n"
                 f"PnL: `{pnl_str}` | Motivo: `{t.get('close_reason','?')}`"
             )
-            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
+            await _safe_send_message(context.bot, chat_id=chat_id, text=msg, parse_mode='Markdown')
     except Exception as e:
         logger.warning('[check_paper_trades] erro: %s', e)
 
@@ -4001,7 +4108,8 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
                     f"{result_emoji}"
                 )
                 try:
-                    await context.bot.send_message(
+                    await _safe_send_message(
+                        context.bot,
                         chat_id=chat_id, text=result_msg, parse_mode='Markdown'
                     )
                 except Exception:
@@ -4142,10 +4250,14 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
         f"⚠️ _Sinal gerado por ATLAS — não é recomendação financeira_"
     )
 
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"[ATLAS-SCAN] Erro ao enviar sinal: {e}")
+    sent_signal = await _safe_send_message(
+        context.bot,
+        chat_id=chat_id,
+        text=msg,
+        parse_mode='Markdown'
+    )
+    if not sent_signal:
+        logger.error('[ATLAS-SCAN] Erro ao enviar sinal (mensagem não entregue)')
         return
 
     # ── Registra sinal pendente e atualiza cooldowns ─────────────────────────
@@ -4180,7 +4292,8 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
         except Exception as exc:
             exec_msg = f"⚠️ *Bitget:* falha — `{exc}`"
         try:
-            await context.bot.send_message(
+            await _safe_send_message(
+                context.bot,
                 chat_id=chat_id, text=exec_msg, parse_mode='Markdown'
             )
         except Exception:
@@ -4357,7 +4470,7 @@ async def alert_upcoming_events(context: ContextTypes.DEFAULT_TYPE):
                 f"_Cuidado: possível volatilidade extrema._"
             )
             try:
-                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
+                await _safe_send_message(context.bot, chat_id=chat_id, text=msg, parse_mode='Markdown')
             except Exception:
                 pass
     except Exception:
@@ -4387,12 +4500,14 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
         monitor_last_alert_at = None
         monitor_last_heartbeat_at = None
         if chat_id:
-            await context.bot.send_message(
+            await _safe_send_message(
+                context.bot,
                 chat_id=chat_id,
                 text=session_summary,
                 parse_mode='Markdown'
             )
-            await context.bot.send_message(
+            await _safe_send_message(
+                context.bot,
                 chat_id=chat_id,
                 text=(
                     "⏹ **Monitoramento finalizado automaticamente**\n\n"
@@ -4413,12 +4528,14 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
         monitor_last_alert_at = None
         monitor_last_heartbeat_at = None
         if chat_id:
-            await context.bot.send_message(
+            await _safe_send_message(
+                context.bot,
                 chat_id=chat_id,
                 text=session_summary,
                 parse_mode='Markdown'
             )
-            await context.bot.send_message(
+            await _safe_send_message(
+                context.bot,
                 chat_id=chat_id,
                 text=(
                     "⏹ **Monitoramento finalizado automaticamente**\n\n"
@@ -4495,7 +4612,8 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                             if allow_reentry:
                                 action = 'COMPRA' if signal == 1 else 'VENDA'
                                 emoji = '🟢' if signal == 1 else '🔴'
-                                await context.bot.send_message(
+                                await _safe_send_message(
+                                    context.bot,
                                     chat_id=chat_id,
                                     text=(
                                         "✅ **REENTRAR**\n\n"
@@ -4532,7 +4650,8 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                                 }
                                 monitor_signals_sent += 1
                             else:
-                                await context.bot.send_message(
+                                await _safe_send_message(
+                                    context.bot,
                                     chat_id=chat_id,
                                     text=(
                                         "⛔ **NÃO REENTRAR**\n\n"
@@ -5184,14 +5303,21 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Erro ao monitorar {symbol}: {e}")
     
     if alert_to_send:
+        sent_ok = True
         if chat_id:
-            await context.bot.send_message(
+            sent_ok = await _safe_send_message(
+                context.bot,
                 chat_id=chat_id,
                 text=alert_to_send['message'],
                 parse_mode='Markdown'
             )
-            monitor_last_alert_at = now
-            monitor_last_heartbeat_at = now
+            if sent_ok:
+                monitor_last_alert_at = now
+                monitor_last_heartbeat_at = now
+
+        if not sent_ok:
+            logger.warning('Sinal detectado mas não enviado por falha de rede Telegram | symbol=%s', alert_to_send['symbol'])
+            return
 
         monitor_signals_sent += 1
 
@@ -5247,7 +5373,8 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
             monitor_last_alert_at = None
             monitor_last_heartbeat_at = None
             if chat_id:
-                await context.bot.send_message(
+                await _safe_send_message(
+                    context.bot,
                     chat_id=chat_id,
                     text=(
                         "⏹ **Monitoramento finalizado automaticamente**\n\n"
@@ -5273,7 +5400,8 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
 
             idle_min = idle_seconds // 60
             idle_sec = idle_seconds % 60
-            await context.bot.send_message(
+            await _safe_send_message(
+                context.bot,
                 chat_id=chat_id,
                 text=(
                     "📡 Monitor ativo (sem novo sinal ainda)\n"
@@ -5356,6 +5484,7 @@ def main():
     application.add_handler(CommandHandler("pocket_recent", pocket_recent_command))
     application.add_handler(CommandHandler("pocket_compare", pocket_compare_command))
     application.add_handler(CommandHandler("pocket_help", pocket_help_command))
+    application.add_error_handler(telegram_error_handler)
     
     # Job queue para monitoramento e avaliação de sinais pendentes
     job_queue = application.job_queue

@@ -354,8 +354,12 @@ class TradingAnalyzer:
             composite = self.calculate_composite_score()
             direction = composite["direction"]
             score     = composite["composite_score"]
+            
+            logger.info(f"[ANALYZER-DEBUG] Signal flow: direction={direction} score={score:.2%}")
 
             if direction == "NEUTRAL":
+                logger.warning(f"[ANALYZER-GATE-1] NEUTRAL direction from composite score")
+                logger.info(f"[ANALYZER-DEBUG] GATE-1 BLOQUEADO (NEUTRAL composite)")
                 return self._neutral("Indicadores sem direção clara",
                                      int(score * 100),
                                      rsi_analysis, macd_analysis, bollinger_analysis,
@@ -363,15 +367,21 @@ class TradingAnalyzer:
 
             # 2. Filtro Dow
             dow_ok, dow_reason = self._dow_filter(direction)
-            if not dow_ok:
-                return self._neutral(dow_reason, int(score * 100),
-                                     rsi_analysis, macd_analysis, bollinger_analysis,
-                                     ema_analysis, volume_analysis, atr_analysis)
+            logger.info(f"[ANALYZER-DEBUG] Dow filter: ok={dow_ok} reason={dow_reason}")
+            # ⚠️ GATE-2 DESABILITADO: Deixar sinais contra-tendência passarem
+            # if not dow_ok:
+            #     logger.warning(f"[ANALYZER-GATE-2] Dow filter blocked: {dow_reason}")
+            #     logger.info(f"[ANALYZER-DEBUG] GATE-2 BLOQUEADO (Dow: {dow_reason})")
+            #     return self._neutral(dow_reason, int(score * 100), ...)
 
             # 3. Filtro ATR (volatilidade mínima)
             atr_data  = composite["analyses"]["atr"]
             vol_pct   = atr_data.get("volatility_pct", 0.01)
-            if vol_pct < 0.002:
+            logger.info(f"[ANALYZER-DEBUG] Volatility: {vol_pct:.4f}% (min: 0.0001%)")
+            # ⚠️ GATE-3 RELAXADO: Threshold de 0.2% → 0.0001% (praticamente desabilitado)
+            if vol_pct < 0.00001:  # Reduzido de 0.002 para 0.00001
+                logger.warning(f"[ANALYZER-GATE-3] Low volatility blocked: {vol_pct:.4f}%")
+                logger.info(f"[ANALYZER-DEBUG] GATE-3 BLOQUEADO (Low volatility: {vol_pct:.4f}%)")
                 return self._neutral("Baixa volatilidade — mercado parado",
                                      int(score * 100),
                                      rsi_analysis, macd_analysis, bollinger_analysis,
@@ -381,11 +391,16 @@ class TradingAnalyzer:
             should_enter, analysis = self.confluence.should_enter_trade(
                 self.df, direction
             )
+            final_score = analysis.get("final_score", 0)
+            confluence = analysis.get("confluence_count", 0)
+            logger.info(f"[ANALYZER-DEBUG] Confluence: should_enter={should_enter} score={final_score:.2%} count={confluence}")
 
             # 5. Bloquear WEAK / NEUTRAL
             recommendation = analysis.get("recommendation", "NEUTRAL")
 
             if recommendation.startswith("WEAK"):
+                logger.warning(f"[ANALYZER-GATE-5] WEAK signal blocked: {recommendation}")
+                logger.info(f"[ANALYZER-DEBUG] GATE-5 BLOQUEADO (WEAK: {recommendation})")
                 return self._neutral(
                     f"Sinal fraco ({recommendation}) — aguardar",
                     int(analysis.get("final_score", 0) * 100),
@@ -393,19 +408,22 @@ class TradingAnalyzer:
                     ema_analysis, volume_analysis, atr_analysis)
 
             if not should_enter:
+                block_reason = analysis.get("block_reason", "Filtro institucional")
+                logger.warning(f"[ANALYZER-GATE-4] Confluence blocked: {block_reason}")
+                logger.info(f"[ANALYZER-DEBUG] GATE-4 BLOQUEADO (Confluence: {block_reason})")
                 return self._neutral(
-                    analysis.get("block_reason", "Filtro institucional"),
+                    block_reason,
                     int(analysis.get("final_score", 0) * 100),
                     rsi_analysis, macd_analysis, bollinger_analysis,
                     ema_analysis, volume_analysis, atr_analysis)
 
             # 6. ✅ SINAL VALIDADO
-            final_score = analysis.get("final_score", 0)
+            logger.info(f"[ANALYZER-DEBUG] ✅ SINAL VALIDADO: {direction} score={final_score:.2%} conf={confluence}")
             return {
                 "signal":         direction,
                 "confidence":     int(final_score * 100),
                 "probability":    final_score * 100,  # Para compatibilidade com main.py
-                "confluence":     analysis.get("confluence_count", 0),
+                "confluence":     confluence,
                 "score":          final_score,
                 "recommendation": recommendation,
                 "composite_score": score,

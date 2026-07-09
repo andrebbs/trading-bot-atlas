@@ -1,5 +1,151 @@
 from __future__ import annotations
 
+
+# === ATLAS INTELLIGENT SCANNER PATCH ===
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import os
+from datetime import datetime
+from typing import Any, Dict
+
+try:
+    from telegram.ext import CommandHandler
+except Exception:
+    CommandHandler = None
+
+SCANNER_STATE: Dict[str, Any] = {
+    "enabled": os.getenv("ATLAS_SCANNER_ENABLED", "false").lower() in ("1", "true", "yes", "on"),
+    "interval": int(os.getenv("ATLAS_SCANNER_INTERVAL_SECONDS", "300")),
+    "timeframe": os.getenv("ATLAS_SCANNER_TIMEFRAME", "5m"),
+    "symbols": [s.strip() for s in os.getenv("ATLAS_SCANNER_SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",") if s.strip()],
+    "min_score": float(os.getenv("ATLAS_SCANNER_MIN_SCORE", "0.58")),
+    "last_alert": {},
+    "cooldown_seconds": int(os.getenv("ATLAS_SCANNER_COOLDOWN_SECONDS", "900")),
+}
+
+def _now_str() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def _normalize_confluence_result(symbol: str, raw: Any) -> Dict[str, Any]:
+    if raw is None:
+        return {"symbol": symbol, "score": 0.0, "signal": "NEUTRAL", "confidence": 0.0, "valid": False}
+    if isinstance(raw, dict):
+        score = float(raw.get("score", raw.get("confluence_score", raw.get("total_score", 0))) or 0)
+        signal = str(raw.get("signal", raw.get("direction", raw.get("recommendation", "NEUTRAL")))).upper()
+        confidence = float(raw.get("confidence", raw.get("probability", score)) or 0)
+        valid = bool(raw.get("valid", raw.get("should_trade", raw.get("should_enter", False))))
+        if signal in ("BUY","LONG","CALL","BULLISH","SELL","SHORT","PUT","BEARISH") and score >= SCANNER_STATE["min_score"]:
+            valid = True
+        return {**raw, "symbol": symbol, "score": score, "signal": signal, "confidence": confidence, "valid": valid}
+    score = float(getattr(raw, "score", getattr(raw, "confluence_score", 0)) or 0)
+    signal = str(getattr(raw, "signal", getattr(raw, "direction", "NEUTRAL"))).upper()
+    confidence = float(getattr(raw, "confidence", score) or 0)
+    valid = bool(getattr(raw, "valid", getattr(raw, "should_trade", False)))
+    return {"symbol": symbol, "score": score, "signal": signal, "confidence": confidence, "valid": valid, "raw": raw}
+
+def _run_confluence_analysis(symbol: str, timeframe: str = "5m") -> Dict[str, Any]:
+    try:
+        cls = globals().get("ConfluenceScoreSystem")
+        if cls is None:
+            from src.core.confluence_score import ConfluenceScoreSystem as cls
+        system = cls()
+        for method_name in ("analyze", "analyze_symbol", "calculate", "get_signal"):
+            method = getattr(system, method_name, None)
+            if callable(method):
+                try:
+                    raw = method(symbol=symbol, timeframe=timeframe)
+                except TypeError:
+                    raw = method(symbol, timeframe)
+                return _normalize_confluence_result(symbol, raw)
+        return {"symbol": symbol, "score": 0.0, "signal": "NEUTRAL", "confidence": 0.0, "valid": False, "error": "No compatible method"}
+    except Exception as e:
+        return {"symbol": symbol, "score": 0.0, "signal": "ERROR", "confidence": 0.0, "valid": False, "error": str(e)}
+
+def _scanner_should_alert(result: Dict[str, Any]) -> bool:
+    symbol = result.get("symbol", "")
+    score = float(result.get("score", 0) or 0)
+    signal = str(result.get("signal", "NEUTRAL")).upper()
+    if not result.get("valid") or score < float(SCANNER_STATE["min_score"]):
+        return False
+    if signal in ("NEUTRAL", "WEAK", "ERROR", "NONE", "WAIT"):
+        return False
+    now = datetime.utcnow().timestamp()
+    key = f"{symbol}:{signal}"
+    last = SCANNER_STATE["last_alert"].get(key, 0)
+    if now - last < int(SCANNER_STATE["cooldown_seconds"]):
+        return False
+    SCANNER_STATE["last_alert"][key] = now
+    return True
+
+def _format_scanner_alert(result: Dict[str, Any]) -> str:
+    return (
+        "🔥 ATLAS SCANNER ALERT\n"
+        f"Ativo: {result.get('symbol')}\n"
+        f"Sinal: {result.get('signal')}\n"
+        f"Score: {float(result.get('score', 0) or 0):.2f}\n"
+        f"Confiança: {float(result.get('confidence', 0) or 0):.2f}\n"
+        f"Timeframe: {SCANNER_STATE.get('timeframe')}\n"
+        f"Horário: {_now_str()}"
+    )
+
+async def atlas_scanner_job(context) -> None:
+    if not SCANNER_STATE.get("enabled"):
+        return
+    chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
+    for symbol in list(SCANNER_STATE.get("symbols", [])):
+        result = _run_confluence_analysis(symbol, SCANNER_STATE.get("timeframe", "5m"))
+        if _scanner_should_alert(result) and chat_id:
+            await _safe_send_message(context.bot, chat_id=chat_id, text=_format_scanner_alert(result))
+
+async def scanner_command(update, context):
+    args = [a.lower() for a in getattr(context, "args", [])]
+    if not args or args[0] == "status":
+        status = "ON ✅" if SCANNER_STATE["enabled"] else "OFF ❌"
+        await update.message.reply_text(
+            f"Scanner: {status}\nIntervalo: {SCANNER_STATE['interval']}s\n"
+            f"Timeframe: {SCANNER_STATE['timeframe']}\nMin score: {SCANNER_STATE['min_score']}\n"
+            f"Ativos: {', '.join(SCANNER_STATE['symbols'])}"
+        )
+    elif args[0] == "on":
+        SCANNER_STATE["enabled"] = True
+        await update.message.reply_text("✅ Scanner Inteligente ATLAS ativado")
+    elif args[0] == "off":
+        SCANNER_STATE["enabled"] = False
+        await update.message.reply_text("⛔ Scanner Inteligente ATLAS desativado")
+    elif args[0] in ("intervalo", "interval", "tempo") and len(args) >= 2:
+        minutes = max(1, int(args[1]))
+        SCANNER_STATE["interval"] = minutes * 60
+        jq = getattr(context.application, "job_queue", None)
+        if jq:
+            for job in jq.get_jobs_by_name("atlas_scanner_job"):
+                job.schedule_removal()
+            jq.run_repeating(atlas_scanner_job, interval=SCANNER_STATE["interval"], first=5, name="atlas_scanner_job")
+        await update.message.reply_text(f"⏱ Intervalo ajustado para {minutes} min")
+    elif args[0] in ("symbols", "ativos") and len(args) >= 2:
+        syms = []
+        for raw in args[1:]:
+            syms.extend([x.strip().upper() for x in raw.split(",") if x.strip()])
+        SCANNER_STATE["symbols"] = syms
+        await update.message.reply_text(f"✅ Ativos atualizados: {', '.join(syms)}")
+    elif args[0] in ("tf", "timeframe") and len(args) >= 2:
+        SCANNER_STATE["timeframe"] = args[1]
+        await update.message.reply_text(f"✅ Timeframe atualizado: {args[1]}")
+    else:
+        await update.message.reply_text(
+            "Comandos:\n/scanner on\n/scanner off\n/scanner status\n"
+            "/scanner intervalo 5\n/scanner ativos BTC/USDT,ETH/USDT\n/scanner timeframe 5m"
+        )
+
+def register_atlas_scanner(application) -> None:
+    if CommandHandler is not None:
+        application.add_handler(CommandHandler("scanner", scanner_command))
+    jq = getattr(application, "job_queue", None)
+    if jq:
+        jq.run_repeating(atlas_scanner_job, interval=SCANNER_STATE["interval"], first=10, name="atlas_scanner_job")
+
+# === END ATLAS INTELLIGENT SCANNER PATCH ===
+
 """
 Bot de Trading para Telegram
 Envia notificações automáticas de sinais e responde comandos
@@ -8,6 +154,7 @@ import sys
 import os
 import json
 import logging
+import asyncio
 import time
 import re
 import requests
@@ -19,6 +166,7 @@ import fcntl
 import numpy as np
 import pandas as pd
 from telegram import Update
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -155,6 +303,24 @@ def _env_flag(raw_value: str | None, default: bool = False) -> bool:
     return raw_value.strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
+DETAIL_REQUEST_TOKENS = {'detalhe', 'detalhes', 'detail', 'details', 'full', 'completo'}
+
+
+def _split_analysis_args(args: list[str] | None) -> tuple[bool, list[str]]:
+    """Separa flag de detalhe dos demais argumentos de análise."""
+    detail_requested = False
+    cleaned_args: list[str] = []
+
+    for raw_arg in args or []:
+        normalized = str(raw_arg or '').strip().lower()
+        if normalized in DETAIL_REQUEST_TOKENS:
+            detail_requested = True
+            continue
+        cleaned_args.append(raw_arg)
+
+    return detail_requested, cleaned_args
+
+
 # Configuração de logging
 LOGS_DIR = PROJECT_ROOT / 'logs'
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -168,6 +334,110 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+_telegram_log_throttle = {}
+TELEGRAM_SEND_MAX_ATTEMPTS = max(1, int(os.getenv('TELEGRAM_SEND_MAX_ATTEMPTS', '4')))
+TELEGRAM_SEND_BACKOFF_SECONDS = max(0.5, float(os.getenv('TELEGRAM_SEND_BACKOFF_SECONDS', '1.5')))
+TELEGRAM_SEND_BACKOFF_MAX_SECONDS = max(2.0, float(os.getenv('TELEGRAM_SEND_BACKOFF_MAX_SECONDS', '20')))
+
+
+def _is_transient_telegram_error(exc: Exception) -> bool:
+    if isinstance(exc, (NetworkError, TimedOut, RetryAfter)):
+        return True
+
+    msg = str(exc).lower()
+    transient_markers = (
+        'temporary failure in name resolution',
+        'name resolution',
+        'network is unreachable',
+        'connection reset',
+        'server disconnected',
+        'timed out',
+        'timeout',
+        'bad gateway',
+        'service unavailable',
+    )
+    return any(marker in msg for marker in transient_markers)
+
+
+def _log_telegram_throttled(level: int, key: str, message: str, *args) -> None:
+    now_ts = time.time()
+    last_ts = _telegram_log_throttle.get(key, 0.0)
+    if now_ts - last_ts < 60:
+        return
+    _telegram_log_throttle[key] = now_ts
+    logger.log(level, message, *args)
+
+
+async def _safe_send_message(bot, chat_id, text: str, **kwargs) -> bool:
+    last_exc = None
+
+    for attempt in range(1, TELEGRAM_SEND_MAX_ATTEMPTS + 1):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            return True
+        except RetryAfter as exc:
+            last_exc = exc
+            wait_seconds = float(getattr(exc, 'retry_after', TELEGRAM_SEND_BACKOFF_SECONDS))
+            wait_seconds = max(1.0, min(wait_seconds, TELEGRAM_SEND_BACKOFF_MAX_SECONDS))
+            _log_telegram_throttled(
+                logging.WARNING,
+                'retry_after',
+                'Telegram rate limit/retry-after. attempt=%s/%s wait=%.1fs',
+                attempt,
+                TELEGRAM_SEND_MAX_ATTEMPTS,
+                wait_seconds,
+            )
+            if attempt >= TELEGRAM_SEND_MAX_ATTEMPTS:
+                break
+            await asyncio.sleep(wait_seconds)
+        except TelegramError as exc:
+            last_exc = exc
+            if not _is_transient_telegram_error(exc) or attempt >= TELEGRAM_SEND_MAX_ATTEMPTS:
+                break
+            wait_seconds = min(
+                TELEGRAM_SEND_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+                TELEGRAM_SEND_BACKOFF_MAX_SECONDS,
+            )
+            _log_telegram_throttled(
+                logging.WARNING,
+                'telegram_transient_error',
+                'Falha transitória ao enviar Telegram. attempt=%s/%s wait=%.1fs err=%s',
+                attempt,
+                TELEGRAM_SEND_MAX_ATTEMPTS,
+                wait_seconds,
+                exc,
+            )
+            await asyncio.sleep(wait_seconds)
+        except Exception as exc:
+            last_exc = exc
+            break
+
+    _log_telegram_throttled(
+        logging.ERROR,
+        'telegram_send_final_error',
+        'Falha definitiva ao enviar mensagem Telegram apos %s tentativas. err=%s',
+        TELEGRAM_SEND_MAX_ATTEMPTS,
+        last_exc,
+    )
+    return False
+
+
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = getattr(context, 'error', None)
+    if err is None:
+        return
+
+    if isinstance(err, TelegramError) and _is_transient_telegram_error(err):
+        _log_telegram_throttled(
+            logging.WARNING,
+            'telegram_handler_transient',
+            'Erro transitório no Telegram tratado pelo handler global: %s',
+            err,
+        )
+        return
+
+    logger.exception('Erro não tratado no loop do Telegram: %s', err)
 
 DIAGNOSTICS_LOG_PATH = LOGS_DIR / f'market_diagnostics_{BOT_PROFILE}.log'
 diagnostics_logger = logging.getLogger(f'{__name__}.market_diagnostics')
@@ -286,6 +556,7 @@ if _saved_tf and _saved_tf in SUPPORTED_TIMEFRAMES:
 MONITOR_INTERVAL_SECONDS = 5
 MONITOR_DURATION_MINUTES = _env_int('MONITOR_DURATION_MINUTES', 60, min_value=5)
 MONITOR_MAX_SIGNALS = _env_int('MONITOR_MAX_SIGNALS', 4)
+MONITOR_CONTINUOUS_MODE = _env_flag(get_profile_env('MONITOR_CONTINUOUS_MODE'), default=True)
 MONITOR_NEW_SIGNAL_CYCLE_MINUTES = _env_int('MONITOR_NEW_SIGNAL_CYCLE_MINUTES', 5)
 MONITOR_PRE_ALERT_MAX_SECONDS = 20
 MONITOR_PRE_ALERT_MIN_SECONDS = 10
@@ -1110,74 +1381,6 @@ def resolve_market_symbol(symbol: str):
     return raw, None
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# TELEMETRIA DO FUNIL DE SINAIS (signal-or-explain) — patch Jul/2026
-# Registra por que cada candidato foi descartado e expõe isso no heartbeat,
-# junto com o melhor candidato rejeitado desde o último status.
-# ═══════════════════════════════════════════════════════════════════════
-monitor_block_stats: dict = {}
-monitor_best_candidate: dict = {}
-monitor_analysis_count: dict = {'analyzed': 0, 'with_direction': 0, 'idle_cycles': 0}
-
-
-def _register_monitor_block(symbol, timeframe, signal, reason, rank=0.0):
-    """Registra descarte de candidato para o heartbeat explicativo."""
-    try:
-        monitor_block_stats[reason] = monitor_block_stats.get(reason, 0) + 1
-        if signal != 0 and float(rank) >= float(monitor_best_candidate.get('rank', float('-inf'))):
-            monitor_best_candidate.clear()
-            monitor_best_candidate.update({
-                'symbol': symbol,
-                'timeframe': timeframe,
-                'signal': int(signal),
-                'reason': reason,
-                'rank': float(rank),
-                'at': datetime.now(),
-            })
-    except Exception:
-        pass
-
-
-def _build_heartbeat_funnel_text() -> str:
-    """Anexa ao heartbeat o funil de análises e o melhor candidato rejeitado."""
-    try:
-        parts = []
-        analyzed = int(monitor_analysis_count.get('analyzed', 0))
-        with_direction = int(monitor_analysis_count.get('with_direction', 0))
-        parts.append(
-            f"\n\n📉 Funil desde o último status: {analyzed} análises → {with_direction} com direção"
-        )
-        idle_cycles = int(monitor_analysis_count.get('idle_cycles', 0))
-        if idle_cycles:
-            parts.append(f"\n🕐 Ciclos fora da janela de pré-alerta: {idle_cycles}")
-        if monitor_block_stats:
-            top = sorted(monitor_block_stats.items(), key=lambda kv: kv[1], reverse=True)[:3]
-            reasons = ' | '.join(f"{reason} ({count}x)" for reason, count in top)
-            parts.append(f"\n⛔ Principais bloqueios: {reasons}")
-        if monitor_best_candidate:
-            direction = 'COMPRA 🟢' if monitor_best_candidate.get('signal') == 1 else 'VENDA 🔴'
-            candidate_time = monitor_best_candidate.get('at')
-            time_txt = candidate_time.strftime('%H:%M:%S') if candidate_time else '-'
-            parts.append(
-                f"\n🎯 Melhor candidato rejeitado: {monitor_best_candidate.get('symbol')} "
-                f"{monitor_best_candidate.get('timeframe')} {direction} ({time_txt})"
-                f"\n   Motivo: {monitor_best_candidate.get('reason')}"
-            )
-        return ''.join(parts)
-    except Exception:
-        return ''
-
-
-def _reset_heartbeat_funnel_stats():
-    """Zera o funil após cada heartbeat para medir a próxima janela."""
-    monitor_block_stats.clear()
-    monitor_best_candidate.clear()
-    monitor_analysis_count['analyzed'] = 0
-    monitor_analysis_count['with_direction'] = 0
-    monitor_analysis_count['idle_cycles'] = 0
-
-
-
 def timeframe_to_minutes(timeframe: str) -> int:
     """Converte timeframe para minutos."""
     mapping = {
@@ -1195,14 +1398,9 @@ def timeframe_to_minutes(timeframe: str) -> int:
 def get_pre_alert_window_seconds(timeframe: str) -> Tuple[int, int]:
     """Retorna janela de pre-alerta (max_s, min_s) por timeframe."""
     tf_minutes = timeframe_to_minutes(timeframe)
-    if tf_minutes >= 15:
-        # Patch Jul/2026: janela ampliada. Em 15m/30m entrar até 2min antes
-        # não degrada a entrada e dá tempo de varrer todos os ativos sem
-        # perder a janela operacional (antes: 45-10s).
-        return 120, 15
     if tf_minutes >= 5:
-        # Antes: 45-10s. Ampliado para reduzir perda de janela por latência.
-        return 60, 10
+        # Janela reduzida para sinal mais proximo da abertura do candle.
+        return 45, 10
     return MONITOR_PRE_ALERT_MAX_SECONDS, MONITOR_PRE_ALERT_MIN_SECONDS
 
 
@@ -1960,30 +2158,37 @@ def get_telegram_bot_token():
 
 def bootstrap_auto_monitoring() -> tuple[bool, str | None]:
     """Ativa o monitoramento no boot quando solicitado por ambiente."""
+    if not MONITOR_AUTO_START:
+        return False, None
+
+    chat_id = get_telegram_chat_id()
+    return start_monitoring_session(chat_id=chat_id)
+
+
+def start_monitoring_session(chat_id: str | int | None = None) -> tuple[bool, str | None]:
+    """Ativa o monitor principal de sinais e reseta estado de sessão."""
     global monitoring_active, monitor_end_time, monitor_signals_sent, current_rotation_index
     global pending_signal_evaluations, pending_martingale_decisions, last_pre_alert_key, last_direction_alert_at
     global monitor_target_chat_id, monitor_started_at, monitor_last_alert_at, monitor_last_heartbeat_at
     global monitor_session_results, last_fresh_alert_at, monitor_duration_minutes
 
-    if not MONITOR_AUTO_START:
-        return False, None
-
-    chat_id = get_telegram_chat_id()
-    if not chat_id:
+    target_chat_id = chat_id or get_telegram_chat_id()
+    if not target_chat_id:
         return False, 'TELEGRAM_CHAT_ID ausente'
 
     if not monitored_symbols:
         return False, 'nenhum ativo configurado para monitoramento'
 
+    now = datetime.now()
     monitor_duration_minutes = MONITOR_DURATION_MINUTES
     monitoring_active = True
-    monitor_end_time = datetime.now() + timedelta(minutes=monitor_duration_minutes)
+    monitor_end_time = None if MONITOR_CONTINUOUS_MODE else now + timedelta(minutes=monitor_duration_minutes)
     monitor_signals_sent = 0
     current_rotation_index = 0
-    monitor_target_chat_id = chat_id
-    monitor_started_at = datetime.now()
+    monitor_target_chat_id = target_chat_id
+    monitor_started_at = now
     monitor_last_alert_at = None
-    monitor_last_heartbeat_at = datetime.now()
+    monitor_last_heartbeat_at = now
     pending_signal_evaluations = []
     pending_martingale_decisions = []
     monitor_session_results = []
@@ -1994,9 +2199,35 @@ def bootstrap_auto_monitoring() -> tuple[bool, str | None]:
     return True, None
 
 
+def stop_monitoring_session() -> None:
+    """Desativa o monitor principal e limpa estado efêmero da sessão."""
+    global monitoring_active, monitor_end_time, monitor_target_chat_id, monitor_started_at
+    global monitor_last_alert_at, monitor_last_heartbeat_at
+
+    monitoring_active = False
+    monitor_end_time = None
+    monitor_target_chat_id = None
+    monitor_started_at = None
+    monitor_last_alert_at = None
+    monitor_last_heartbeat_at = None
+
+
+def roll_monitor_cycle(now: datetime) -> None:
+    """Renova ciclo do monitor sem desligar, evitando paradas silenciosas."""
+    global monitor_end_time, monitor_signals_sent, monitor_started_at, monitor_last_heartbeat_at
+
+    monitor_signals_sent = 0
+    monitor_started_at = now
+    monitor_last_heartbeat_at = now
+    if MONITOR_CONTINUOUS_MODE:
+        monitor_end_time = None
+    else:
+        monitor_end_time = now + timedelta(minutes=monitor_duration_minutes)
+
+
 async def notify_auto_monitor_started(context: ContextTypes.DEFAULT_TYPE):
     """Envia confirmação de auto-start para o chat alvo."""
-    if not _auto_scan_active:
+    if not monitoring_active:
         return
 
     chat_id = monitor_target_chat_id or get_telegram_chat_id()
@@ -2011,11 +2242,13 @@ async def notify_auto_monitor_started(context: ContextTypes.DEFAULT_TYPE):
     forex_status = f'✅ {forex_label}' if forex_session_ok else f'🔒 Fora de sessão ({forex_label})'
     interval_min = _SCAN_SIGNAL_INTERVAL // 60
 
-    await context.bot.send_message(
+    await _safe_send_message(
+        context.bot,
         chat_id=chat_id,
         text=(
             "🤖 *abbsCrypto iniciado*\n\n"
-            "📡 *Scanner automático ATIVO*\n"
+            f"📡 *Scanner automático:* {'ATIVO' if _auto_scan_active else 'INATIVO'}\n"
+            f"🎯 *Monitor principal:* {'ATIVO' if monitoring_active else 'INATIVO'}\n"
             f"🔬 Engine: TradingView API — 5m + 15m\n"
             f"🧭 Modo operacional: *{mode_label}*\n"
             f"🚦 Filtro de qualidade: sinais fortes + confirmação de contexto\n"
@@ -2081,7 +2314,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     main_section = """
 📊 **Análise:**
-/analise - Análise completa do ativo atual
+/analise - Resumo rápido do ativo atual
+/analise detalhes - Mostra a justificativa completa
 /btc - Análise do Bitcoin (BTC/USDT)
 /eth - Análise do Ethereum (ETH/USDT)
 /sol - Análise do Solana (SOL/USDT)
@@ -2170,7 +2404,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=None, timeframe=None):
+async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=None, timeframe=None, detailed: bool = False):
     """Análise avulsa usando sistema ATLAS (5 técnicas com confluência)."""
     current_symbol = (symbol or config.SYMBOL).upper()
     current_timeframe = _resolve_analysis_timeframe(timeframe)
@@ -2405,50 +2639,71 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
 
         # ── Mensagem principal ──────────────────────────────────
         transfer_tag = ' 💧Liquidez' if has_transfer else ''
-        message = (
-            f"🔥 *ANÁLISE ATLAS — {current_symbol}*\n"
-            f"📅 {now_local.strftime('%d/%m/%Y %H:%M:%S')}\n"
-            f"⏱ Timeframe: `{current_timeframe}`\n"
-            f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n"
-            f"📉 Stoch K/D: `{stoch_k:.1f}/{stoch_d:.1f}`\n\n"
-            f"{rec_emoji} *RECOMENDAÇÃO: {dir_label} — {strength}*{transfer_tag}\n"
-            f"🎯 Score de Confluência: *{score_pct}%* (bruto: {raw_score_pct}%)\n"
-            f"🧪 Classificação ATLAS: *{recommendation_display}*\n"
-            f"✅ Consenso: *{confluence}/5 técnicas* concordam\n\n"
-            f"{confluence_emoji} *Confluência Operacional: {confluence_label}*\n"
-            f"✅ A favor: *{factors_pro}* | ❌ Contra: *{factors_contra}* | ⚪ Neutras: *{factors_neutral}*\n\n"
-            f"📊 *Breakdown por Técnica:*\n"
-            f"{breakdown_text}\n\n"
-            f"🧭 *Direção por Técnica:*\n"
-            f"{directional_text}\n\n"
-            f"ℹ️ Pesos (30%, 25%...) representam importância no modelo, não probabilidade de acerto.\n\n"
-        )
+        short_recommendation = f"{rec_emoji} *RECOMENDAÇÃO: {dir_label} — {strength}*{transfer_tag}"
 
-        if not is_weak:
-            message += f"❗️ Entrada sugerida: `{entry_str}` UTC-3 | Expiração: {expiry_label}\n"
+        if detailed:
+            message = (
+                f"🔥 *ANÁLISE ATLAS — {current_symbol}*\n"
+                f"📅 {now_local.strftime('%d/%m/%Y %H:%M:%S')}\n"
+                f"⏱ Timeframe: `{current_timeframe}`\n"
+                f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n"
+                f"📉 Stoch K/D: `{stoch_k:.1f}/{stoch_d:.1f}`\n\n"
+                f"{short_recommendation}\n"
+                f"🎯 Score de Confluência: *{score_pct}%* (bruto: {raw_score_pct}%)\n"
+                f"🧪 Classificação ATLAS: *{recommendation_display}*\n"
+                f"✅ Consenso: *{confluence}/5 técnicas* concordam\n\n"
+                f"{confluence_emoji} *Confluência Operacional: {confluence_label}*\n"
+                f"✅ A favor: *{factors_pro}* | ❌ Contra: *{factors_contra}* | ⚪ Neutras: *{factors_neutral}*\n\n"
+                f"📊 *Breakdown por Técnica:*\n"
+                f"{breakdown_text}\n\n"
+                f"🧭 *Direção por Técnica:*\n"
+                f"{directional_text}\n\n"
+                f"ℹ️ Pesos (30%, 25%...) representam importância no modelo, não probabilidade de acerto.\n\n"
+            )
 
-        # ── Viés tático scalp ───────────────────────────────────
-        tactical_lines = []
-        if adx < 12:
-            bullish_t = stoch_k > stoch_d and stoch_k < 35 and close >= ema9
-            bearish_t = stoch_k < stoch_d and stoch_k > 65 and close <= ema9
-            if bullish_t:
-                tactical_lines.append("🟢 *Viés tático (scalp):* compra de curto prazo possível")
-                tactical_lines.append("• Condições: ADX muito fraco + Stoch cruzando para cima em região descontada")
-            elif bearish_t:
-                tactical_lines.append("🔴 *Viés tático (scalp):* venda de curto prazo possível")
-                tactical_lines.append("• Condições: ADX muito fraco + Stoch cruzando para baixo em região esticada")
+            if not is_weak:
+                message += f"❗️ Entrada sugerida: `{entry_str}` UTC-3 | Expiração: {expiry_label}\n"
 
-        if tactical_lines:
-            message += "\n" + "\n".join(tactical_lines) + "\n"
+            # ── Viés tático scalp ───────────────────────────────
+            tactical_lines = []
+            if adx < 15:
+                bullish_t = stoch_k > stoch_d and stoch_k < 35 and close >= ema9
+                bearish_t = stoch_k < stoch_d and stoch_k > 65 and close <= ema9
+                if bullish_t:
+                    tactical_lines.append("🟢 *Viés tático (scalp):* compra de curto prazo possível")
+                    tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para cima em região descontada")
+                elif bearish_t:
+                    tactical_lines.append("🔴 *Viés tático (scalp):* venda de curto prazo possível")
+                    tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para baixo em região esticada")
 
-        if is_weak:
-            if recommendation_raw.startswith('WEAK_'):
-                message += "\n⚠️ *Atenção:* Sinal fraco (WEAK) — sem entrada recomendada"
-            elif score_pct < 48:
-                message += "\n⚠️ *Atenção:* Score baixo — aguarde configuração mais clara"
-            elif confluence < 2:
-                message += f"\n⚠️ *Atenção:* Apenas {confluence}/5 técnicas concordam — sinal fraco"
+            if tactical_lines:
+                message += "\n" + "\n".join(tactical_lines) + "\n"
+
+            if is_weak:
+                if recommendation_raw.startswith('WEAK_'):
+                    message += "\n⚠️ *Atenção:* Sinal fraco (WEAK) — sem entrada recomendada"
+                elif score_pct < 48:
+                    message += "\n⚠️ *Atenção:* Score baixo — aguarde configuração mais clara"
+                elif confluence < 2:
+                    message += f"\n⚠️ *Atenção:* Apenas {confluence}/5 técnicas concordam — sinal fraco"
+        else:
+            message = (
+                f"🔥 *ANÁLISE ATLAS — {current_symbol}*\n"
+                f"📅 {now_local.strftime('%d/%m/%Y %H:%M:%S')}\n"
+                f"⏱ Timeframe: `{current_timeframe}`\n"
+                f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n\n"
+                f"{short_recommendation}\n"
+                f"🎯 Score de Confluência: *{score_pct}%*\n"
+                f"🧪 Classificação ATLAS: *{recommendation_display}*\n"
+                f"✅ Consenso: *{confluence}/5 técnicas* | {confluence_emoji} *{confluence_label}*\n"
+                f"📌 Envie `/analise detalhes {current_symbol} {current_timeframe}` para ver a justificativa completa.\n"
+            )
+
+            if not is_weak:
+                message += f"❗️ Entrada sugerida: `{entry_str}` UTC-3 | Expiração: {expiry_label}\n"
+
+            if is_weak:
+                message += "\n⚠️ *Atenção:* sinal fraco — aguarde configuração mais clara"
 
         await update.message.reply_text(message, parse_mode='Markdown')
 
@@ -2461,9 +2716,13 @@ async def analise_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /analise"""
     symbol = None
     timeframe = None
+    detailed = False
 
-    if context.args:
-        raw_symbol = (context.args[0] or '').strip().upper().replace('-', '/').replace(' ', '')
+    detail_requested, args = _split_analysis_args(list(getattr(context, 'args', []) or []))
+    detailed = detail_requested
+
+    if args:
+        raw_symbol = (args[0] or '').strip().upper().replace('-', '/').replace(' ', '')
         alias_map = {
             'BTC': 'BTC/USDT',
             'ETH': 'ETH/USDT',
@@ -2486,10 +2745,10 @@ async def analise_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 symbol = raw_symbol if '/' in raw_symbol else f'{raw_symbol}/USDT'
 
-        if len(context.args) > 1:
-            timeframe = (context.args[1] or '').strip().lower()
+        if len(args) > 1:
+            timeframe = (args[1] or '').strip().lower()
 
-    await analyze(update, context, symbol=symbol, timeframe=timeframe)
+    await analyze(update, context, symbol=symbol, timeframe=timeframe, detailed=detailed)
 
 
 async def _analyze_quick_symbol(
@@ -2499,8 +2758,12 @@ async def _analyze_quick_symbol(
 ):
     """Atalhos de ativo aceitam timeframe opcional: /eth 1m, /btc 5m, etc."""
     timeframe = None
-    if context.args:
-        candidate_tf = (context.args[0] or '').strip().lower()
+    detailed = False
+    detail_requested, args = _split_analysis_args(list(getattr(context, 'args', []) or []))
+    detailed = detail_requested
+
+    if args:
+        candidate_tf = (args[0] or '').strip().lower()
         if candidate_tf in SUPPORTED_TIMEFRAMES:
             timeframe = candidate_tf
         else:
@@ -2510,7 +2773,7 @@ async def _analyze_quick_symbol(
             )
             return
 
-    await analyze(update, context, symbol=symbol, timeframe=timeframe)
+    await analyze(update, context, symbol=symbol, timeframe=timeframe, detailed=detailed)
 
 
 async def btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2650,6 +2913,11 @@ async def timeframe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     tf = (context.args[0] or '').strip().lower()
+    monitor_status_line = (
+        "🟢 Monitor já está ativo para emissão de alertas."
+        if monitoring_active
+        else "⚠️ Monitor está desligado. Use /monitor on para receber sinais automáticos."
+    )
 
     if tf == 'auto':
         monitor_timeframe_mode = 'dynamic'
@@ -2657,7 +2925,8 @@ async def timeframe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "✅ Timeframe dinâmico profissional ativado.\n\n"
             f"🧠 Pool profissional: {', '.join(monitor_dynamic_timeframes)}\n"
-            "O monitor vai priorizar a melhor entrada entre os tempos elegíveis e usar filtro operacional mais rígido.",
+            "O monitor vai priorizar a melhor entrada entre os tempos elegíveis e usar filtro operacional mais rígido.\n"
+            f"{monitor_status_line}",
             parse_mode='Markdown'
         )
         return
@@ -2686,7 +2955,7 @@ async def timeframe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Timeframe alterado para: **{tf}**\n\n"
         f"{style_msg.get(tf, '')}\n\n"
-        "💡 Dica: Use /monitor on para alertas automáticos",
+        f"{monitor_status_line}",
         parse_mode='Markdown'
     )
 
@@ -2814,6 +3083,7 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── STATUS ────────────────────────────────────────────────────────────
     if not arg:
         status_icon = '🟢 ATIVO' if _auto_scan_active else '🔴 INATIVO'
+        monitor_loop_status = '🟢 ATIVO' if monitoring_active else '🔴 INATIVO'
         cooldown_info = ''
         if _auto_scan_active and _scan_last_signal_ts:
             elapsed = int(time.time() - _scan_last_signal_ts)
@@ -2838,7 +3108,8 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await _reply_text(
             update,
-            f"📡 *Scanner automático: {status_icon}*{cooldown_info}{pending_info}\n\n"
+            f"📡 *Scanner automático: {status_icon}*{cooldown_info}{pending_info}\n"
+            f"🎯 *Monitor principal de sinais: {monitor_loop_status}*\n\n"
             f"🔥 *Engine:* ATLAS — Sistema de Confluência (5 técnicas)\n"
             f"📊 *Técnicas:* SMC (30%), Wyckoff (25%), Price Action (20%), Tradicional (15%), Elliott (10%)\n"
             f"🎯 *Consenso:* ≥ 2/5 técnicas + Score ≥ 48% (modo agressivo)\n"
@@ -2858,6 +3129,8 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── LIGAR ─────────────────────────────────────────────────────────────
     if arg in ('on', 'ativar', 'ligar', '1'):
         _auto_scan_active = True
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        started, start_reason = start_monitoring_session(chat_id=chat_id)
         
         # Separa crypto real (com tier) de outros ativos
         crypto_tier1 = sorted(CRYPTO_TIER1_SYMBOLS)
@@ -2870,6 +3143,12 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         forex_status = f'✅ {forex_label}' if forex_session_ok else f'🔒 Fora de sessão ({forex_label})'
         interval_min = _SCAN_SIGNAL_INTERVAL // 60
         
+        monitor_status_note = (
+            "✅ Monitor principal de sinais ativado."
+            if started
+            else f"⚠️ Monitor principal não iniciou: {start_reason}."
+        )
+
         await _reply_text(
             update,
             "✅ *Scanner ATIVADO*\n\n"
@@ -2887,25 +3166,23 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  🔴 TIER 3: {', '.join(crypto_tier3)}\n\n"
             f"💱 *Forex ({len(assets_forex)} pares):* {forex_status}\n\n"
             f"⏱ Varredura: cada 5 min | Cooldown: {interval_min} min entre sinais\n\n"
+            f"{monitor_status_note}\n"
+            f"🔁 Modo contínuo: {'ligado' if MONITOR_CONTINUOUS_MODE else 'desligado'}\n\n"
             "_O bot avisará automaticamente quando encontrar sinal qualificado._"
         )
 
     # ── DESLIGAR ──────────────────────────────────────────────────────────
     elif arg in ('off', 'desativar', 'desligar', '0'):
         _auto_scan_active = False
-        await _reply_text(update, "⏹ *Scanner DESATIVADO.*\nUse `/monitor on` para reativar.")
+        stop_monitoring_session()
+        await _reply_text(update, "⏹ *Scanner DESATIVADO.*\n⏹ *Monitor principal de sinais DESATIVADO.*\nUse `/monitor on` para reativar.")
 
     else:
         await _reply_text(update, "❌ Use: `/monitor on` | `/monitor off` | `/monitor` (status)")
 
 
 def _signal_quality_consensus(signal_data: dict, signal: int) -> int:
-    """Retorna consenso: preferir confluência ATLAS se disponível, senão contar indicadores técnicos."""
-    # Se o sinal foi aprovado pelo ATLAS, usar a confluência ATLAS (que é 3-5)
-    if 'confluence_count' in signal_data and signal != 0:
-        return int(signal_data.get('confluence_count', 0))
-    
-    # Fallback: contar indicadores técnicos concordando
+    """Conta quantos indicadores direcionais concordam com o sinal."""
     directional_scores = [
         float(signal_data.get('rsi_score', 0.0)),
         float(signal_data.get('macd_score', 0.0)),
@@ -3757,7 +4034,7 @@ async def externo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_text(update, "❌ Nao encontrei chat alvo para envio.")
         return
 
-    await context.bot.send_message(chat_id=target_chat_id, text=msg, parse_mode='Markdown')
+    await _safe_send_message(context.bot, chat_id=target_chat_id, text=msg, parse_mode='Markdown')
 
     if update.effective_chat and str(update.effective_chat.id) != str(target_chat_id):
         await _reply_text(update, f"✅ Sinal externo registrado e enviado.")
@@ -3831,7 +4108,7 @@ async def check_paper_trades(context: ContextTypes.DEFAULT_TYPE):
                 f"Entry: `{t['price']:.4g}` → Exit: `{t.get('exit_price', 0):.4g}`\n"
                 f"PnL: `{pnl_str}` | Motivo: `{t.get('close_reason','?')}`"
             )
-            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
+            await _safe_send_message(context.bot, chat_id=chat_id, text=msg, parse_mode='Markdown')
     except Exception as e:
         logger.warning('[check_paper_trades] erro: %s', e)
 
@@ -3885,7 +4162,8 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
                     f"{result_emoji}"
                 )
                 try:
-                    await context.bot.send_message(
+                    await _safe_send_message(
+                        context.bot,
                         chat_id=chat_id, text=result_msg, parse_mode='Markdown'
                     )
                 except Exception:
@@ -4012,28 +4290,7 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
     else:
         quality = 'FRACO ⚠️'
 
-    # Breakdown por técnica
-    scores = analysis.get('scores', {})
-    breakdown_lines = []
-    tech_map = [
-        ('smc',       '🎯 SMC',       30),
-        ('wyckoff',   '📊 Wyckoff',   25),
-        ('price_action','🕯 Price Action',20),
-        ('traditional','📈 Tradicional',15),
-        ('elliott',   '🌊 Elliott',   10),
-    ]
-    for key, label, weight in tech_map:
-        s = scores.get(key, 0)
-        if s >= 0.6:
-            em = '✅'
-        elif s <= 0.4:
-            em = '❌'
-        else:
-            em = '⚪'
-        breakdown_lines.append(f"  {em} {label}: {s*100:.0f}%")
-    breakdown = '\n'.join(breakdown_lines)
-
-    transfer_tag = '\n💧 *Liquidez detectada* (SMC)' if has_tr else ''
+    transfer_note = '💧 Liquidez detectada (SMC)\n\n' if has_tr else ''
 
     msg = (
         f"🚨 *SINAL ATLAS — {symbol}*\n"
@@ -4042,15 +4299,19 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
         f"🎯 Score: `{score_pct:.0f}%` | Consenso: `{consensus}/5`\n"
         f"🏷 Tier: {tier_name} | TF: {sig['tf'].upper()}\n\n"
         f"💵 Preço: `{close:.4g}` | RSI: `{rsi:.1f}` | ADX: `{adx:.1f}`\n\n"
-        f"📊 *Breakdown ATLAS:*\n{breakdown}"
-        f"{transfer_tag}\n\n"
+        f"{transfer_note}"
+        f"📌 Para ver a justificativa completa, use `/analise detalhes {symbol} {sig['tf'].lower()}`\n\n"
         f"⚠️ _Sinal gerado por ATLAS — não é recomendação financeira_"
     )
 
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"[ATLAS-SCAN] Erro ao enviar sinal: {e}")
+    sent_signal = await _safe_send_message(
+        context.bot,
+        chat_id=chat_id,
+        text=msg,
+        parse_mode='Markdown'
+    )
+    if not sent_signal:
+        logger.error('[ATLAS-SCAN] Erro ao enviar sinal (mensagem não entregue)')
         return
 
     # ── Registra sinal pendente e atualiza cooldowns ─────────────────────────
@@ -4085,7 +4346,8 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
         except Exception as exc:
             exec_msg = f"⚠️ *Bitget:* falha — `{exc}`"
         try:
-            await context.bot.send_message(
+            await _safe_send_message(
+                context.bot,
                 chat_id=chat_id, text=exec_msg, parse_mode='Markdown'
             )
         except Exception:
@@ -4262,7 +4524,7 @@ async def alert_upcoming_events(context: ContextTypes.DEFAULT_TYPE):
                 f"_Cuidado: possível volatilidade extrema._"
             )
             try:
-                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
+                await _safe_send_message(context.bot, chat_id=chat_id, text=msg, parse_mode='Markdown')
             except Exception:
                 pass
     except Exception:
@@ -4282,57 +4544,77 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
     chat_id = monitor_target_chat_id or get_telegram_chat_id()
     now = datetime.now()
 
-    # Desativa monitoramento automaticamente ao fim da janela configurada.
+    # Em modo contínuo, renova o ciclo automaticamente para evitar parada silenciosa.
     if monitor_end_time and now >= monitor_end_time:
-        session_summary = build_monitor_session_summary('tempo máximo atingido')
-        monitoring_active = False
-        monitor_end_time = None
-        monitor_target_chat_id = None
-        monitor_started_at = None
-        monitor_last_alert_at = None
-        monitor_last_heartbeat_at = None
-        if chat_id:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=session_summary,
-                parse_mode='Markdown'
-            )
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "⏹ **Monitoramento finalizado automaticamente**\n\n"
-                    f"Duração máxima de {monitor_duration_minutes} minutos atingida.\n"
-                    "Use /monitor on para iniciar um novo ciclo."
-                ),
-                parse_mode='Markdown'
-            )
-        return
+        if MONITOR_CONTINUOUS_MODE:
+            roll_monitor_cycle(now)
+            if chat_id:
+                await _safe_send_message(
+                    context.bot,
+                    chat_id=chat_id,
+                    text=(
+                        "🔁 Monitor contínuo: novo ciclo iniciado automaticamente\n\n"
+                        f"Duração alvo por ciclo: {monitor_duration_minutes} minutos."
+                    ),
+                    parse_mode='Markdown'
+                )
+        else:
+            session_summary = build_monitor_session_summary('tempo máximo atingido')
+            stop_monitoring_session()
+            if chat_id:
+                await _safe_send_message(
+                    context.bot,
+                    chat_id=chat_id,
+                    text=session_summary,
+                    parse_mode='Markdown'
+                )
+                await _safe_send_message(
+                    context.bot,
+                    chat_id=chat_id,
+                    text=(
+                        "⏹ **Monitoramento finalizado automaticamente**\n\n"
+                        f"Duração máxima de {monitor_duration_minutes} minutos atingida.\n"
+                        "Use /monitor on para iniciar um novo ciclo."
+                    ),
+                    parse_mode='Markdown'
+                )
+            return
 
-    # Encerra sessão ao atingir limite e sem avaliações pendentes.
+    # Em modo contínuo, reinicia contagem de sessão ao atingir limite sem avaliações pendentes.
     if monitor_signals_sent >= MONITOR_MAX_SIGNALS and not pending_signal_evaluations:
-        session_summary = build_monitor_session_summary('limite de sinais atingido')
-        monitoring_active = False
-        monitor_end_time = None
-        monitor_target_chat_id = None
-        monitor_started_at = None
-        monitor_last_alert_at = None
-        monitor_last_heartbeat_at = None
-        if chat_id:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=session_summary,
-                parse_mode='Markdown'
-            )
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "⏹ **Monitoramento finalizado automaticamente**\n\n"
-                    f"Limite de {MONITOR_MAX_SIGNALS} sinais atingido.\n"
-                    "Use /monitor on para iniciar um novo ciclo."
-                ),
-                parse_mode='Markdown'
-            )
-        return
+        if MONITOR_CONTINUOUS_MODE:
+            roll_monitor_cycle(now)
+            if chat_id:
+                await _safe_send_message(
+                    context.bot,
+                    chat_id=chat_id,
+                    text=(
+                        "🔁 Monitor contínuo: limite de sinais do ciclo atingido\n\n"
+                        f"Novo ciclo iniciado automaticamente (limite por ciclo: {MONITOR_MAX_SIGNALS})."
+                    ),
+                    parse_mode='Markdown'
+                )
+        else:
+            session_summary = build_monitor_session_summary('limite de sinais atingido')
+            stop_monitoring_session()
+            if chat_id:
+                await _safe_send_message(
+                    context.bot,
+                    chat_id=chat_id,
+                    text=session_summary,
+                    parse_mode='Markdown'
+                )
+                await _safe_send_message(
+                    context.bot,
+                    chat_id=chat_id,
+                    text=(
+                        "⏹ **Monitoramento finalizado automaticamente**\n\n"
+                        f"Limite de {MONITOR_MAX_SIGNALS} sinais atingido.\n"
+                        "Use /monitor on para iniciar um novo ciclo."
+                    ),
+                    parse_mode='Markdown'
+                )
+            return
     
     # Avalia sinais pendentes primeiro
     remaining_evaluations = []
@@ -4368,23 +4650,13 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                         current_price = float(df_live.iloc[-1]['close'])
 
                     entry_price = float(pending.get('entry_price') or current_price)
-                    # Safe conversion: handle 'NEUTRAL' string and other edge cases
-                    pending_signal_val = pending['signal']
-                    if isinstance(pending_signal_val, str) and pending_signal_val == 'NEUTRAL':
-                        pending_signal = 0
-                    else:
-                        pending_signal = int(pending_signal_val) if pending_signal_val else 0
+                    pending_signal = int(pending['signal'])
                     is_losing_now = (
                         current_price < entry_price if pending_signal == 1 else current_price > entry_price
                     )
 
                     if is_losing_now:
-                        # Safe conversion: handle 'NEUTRAL' string and other edge cases
-                        weekend_signal_val = weekend_setup['signal']
-                        if isinstance(weekend_signal_val, str) and weekend_signal_val == 'NEUTRAL':
-                            signal = 0
-                        else:
-                            signal = int(weekend_signal_val) if weekend_signal_val else 0
+                        signal = int(weekend_setup['signal'])
                         setup_score = int(weekend_setup['score'])
                         probability = float(weekend_setup['probability'])
                         score = max(float(signal_data.get('score', 0.5)), float(setup_score) / 10.0)
@@ -4410,7 +4682,8 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                             if allow_reentry:
                                 action = 'COMPRA' if signal == 1 else 'VENDA'
                                 emoji = '🟢' if signal == 1 else '🔴'
-                                await context.bot.send_message(
+                                await _safe_send_message(
+                                    context.bot,
                                     chat_id=chat_id,
                                     text=(
                                         "✅ **REENTRAR**\n\n"
@@ -4447,7 +4720,8 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                                 }
                                 monitor_signals_sent += 1
                             else:
-                                await context.bot.send_message(
+                                await _safe_send_message(
+                                    context.bot,
                                     chat_id=chat_id,
                                     text=(
                                         "⛔ **NÃO REENTRAR**\n\n"
@@ -4582,8 +4856,6 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
     total_symbols = len(monitored_symbols)
     actionable_timeframes = get_actionable_monitor_timeframes(now)
     symbols_per_cycle = get_symbols_per_cycle(total_symbols, actionable_timeframes)
-    if not actionable_timeframes:
-        monitor_analysis_count['idle_cycles'] = monitor_analysis_count.get('idle_cycles', 0) + 1
 
     symbols_to_check = []
     for i in range(symbols_per_cycle):
@@ -4667,7 +4939,7 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                 min_probability, min_edge, min_consensus = get_quality_gates(timeframe)
                 min_setup_score = get_setup_min_score(timeframe)
 
-                df = exchange.fetch_ohlcv(market_symbol, timeframe, limit=300)
+                df = exchange.fetch_ohlcv(market_symbol, timeframe, limit=500)
                 if df is None or len(df) < 30:
                     continue
 
@@ -4688,32 +4960,16 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                 current_price = ticker['last'] if ticker else closed_df.iloc[-1]['close']
 
                 if weekend_setup is not None:
-                    # Safe conversion: handle 'NEUTRAL' string and other edge cases
-                    weekend_signal_val = weekend_setup['signal']
-                    if isinstance(weekend_signal_val, str) and weekend_signal_val == 'NEUTRAL':
-                        signal = 0
-                    else:
-                        signal = int(weekend_signal_val) if weekend_signal_val else 0
+                    signal = int(weekend_setup['signal'])
                     score = max(
                         float(signal_data.get('score', 0.5)),
                         float(weekend_setup['score']) / 10.0,
                     )
                     signal_data['probability'] = float(weekend_setup['probability'])
                 else:
-                    # ⚠️ IMPORTANTE: analyzer.get_current_signal() retorna signal como STRING ("BUY"/"SELL"/"NEUTRAL")
-                    # Converter para número (1/-1/0) para compatibilidade com lógica abaixo
-                    signal_str = signal_data['signal']
-                    if signal_str == 'BUY':
-                        signal = 1
-                    elif signal_str == 'SELL':
-                        signal = -1
-                    else:
-                        signal = 0
+                    signal = signal_data['signal']
                     score = signal_data['score']
                 symbol_key = get_monitor_signal_scope_key(symbol, timeframe)
-                monitor_analysis_count['analyzed'] += 1
-                if signal != 0:
-                    monitor_analysis_count['with_direction'] += 1
                 
                 # ══════════════════════════════════════════════════════════════
                 # SISTEMA ATLAS - Confluence Score (SMC + Wyckoff + PA + Elliott + Tradicional)
@@ -4721,17 +4977,10 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                 try:
                     direction_str = 'BUY' if signal == 1 else 'SELL' if signal == -1 else 'NEUTRAL'
                     
-                    # ⚠️ IMPORTANTE: PULAR se não há direção (signal == 0)
-                    # ATLAS só faz sentido para sinais com direção clara (BUY ou SELL)
-                    if signal == 0 or direction_str == 'NEUTRAL':
-                        logger.info(f'[ATLAS-SKIP] {symbol} {timeframe}: signal={signal} NEUTRAL, pulando ATLAS')
-                        continue  # pular este ativo
-                    
                     # Aplica thresholds baseados no tier de liquidez do ativo
                     crypto_profile = _get_crypto_signal_profile(symbol_base) if is_crypto else None
-                    # ⚠️ IMPORTANTE: usar SEMPRE o threshold do .env (MIN), não do profile (que é mais alto)
-                    min_score_threshold = float(os.getenv('ATLAS_MIN_SCORE', '0.45'))
-                    min_confluence_threshold = int(os.getenv('ATLAS_MIN_CONFLUENCE', '3'))
+                    min_score_threshold = crypto_profile['min_score'] if crypto_profile else 0.55
+                    min_confluence_threshold = 3  # 3 técnicas concordando (padrão para todos)
                     
                     # Análise de confluência completa
                     should_enter, confluence_analysis = confluence_system.should_enter_trade(
@@ -4798,7 +5047,6 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                             price_action_score=individual_scores['price_action'],
                             elliott_score=individual_scores['elliott']
                         )
-                        _register_monitor_block(symbol, timeframe, signal, f"ATLAS: {block_reason} (score {final_score_pct}%, confluência {confluence_count}/5)", rank=float(final_score_pct))
                         continue  # pular este sinal
                     
                     # Sinal aprovado - adicionar info de confluência ao signal_data
@@ -4843,20 +5091,9 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                 martingale_step = int(reentry_state.get('alerts_sent', 0)) if is_martingale_alert else 0
 
                 if not should_alert_direction or signal == 0:
-                    logger.info(
-                        f"[POST-ATLAS-DEBUG] {symbol} {timeframe} signal={signal}: "
-                        f"should_alert={should_alert_direction} | "
-                        f"symbol_key_in_last_signal={symbol_key in last_signal} | "
-                        f"last_signal_value={last_signal.get(symbol_key, 'N/A')} | "
-                        f"current_signal={signal} | "
-                        f"cooldown_elapsed={direction_cooldown_elapsed(symbol_key, signal, now, timeframe) if signal != 0 else 'N/A'}"
-                    )
                     continue
 
                 probability = float(signal_data.get('probability', 0.0))
-                # Se probability está em escala 0-1, converter para 0-100
-                if probability <= 1.0:
-                    probability = probability * 100.0
                 edge = abs(float(score) - 0.5)
                 consensus = _signal_quality_consensus(signal_data, signal)
                 atlas_score = float(signal_data.get('atlas_score', score))
@@ -4873,15 +5110,9 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                         "Sinal bloqueado por risco de falso rompimento | symbol=%s timeframe=%s direction=%s",
                         symbol, timeframe, 'BUY' if signal == 1 else 'SELL',
                     )
-                    _register_monitor_block(symbol, timeframe, signal, "risco de falso rompimento", rank=probability)
                     continue
 
                 if probability < min_probability or edge < min_edge or consensus < min_consensus:
-                    logger.info(
-                        f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: qualidade | "
-                        f"prob={probability:.1f}%<{min_probability:.0f}% | edge={edge:.2f}<{min_edge:.2f} | cons={consensus}<{min_consensus}"
-                    )
-                    _register_monitor_block(symbol, timeframe, signal, f"qualidade: prob {probability:.1f}%/{min_probability:.0f}% | edge {edge:.2f}/{min_edge:.2f} | consenso {consensus}/{min_consensus}", rank=probability)
                     continue
 
                 if weekend_mode:
@@ -4905,7 +5136,6 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                             setup['score'],
                             ', '.join(setup['warnings'])
                         )
-                        _register_monitor_block(symbol, timeframe, signal, f"weekend: setup score fraco ({setup['score']}/{min_setup_score})", rank=probability)
                         continue
                     if setup['adx'] > WEEKEND_MAX_ADX:
                         logger.info(
@@ -4914,15 +5144,10 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                             timeframe,
                             setup['adx'],
                         )
-                        _register_monitor_block(symbol, timeframe, signal, f"weekend: ADX alto ({setup['adx']:.1f})", rank=probability)
                         continue
                 else:
                     setup = evaluate_signal_setup(closed_df, signal, signal_data, timeframe)
                     if setup['score'] < min_setup_score:
-                        logger.info(
-                            f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: setup fraco | "
-                            f"score={setup['score']}<{min_setup_score}"
-                        )
                         logger.info(
                             "Sinal descartado por setup fraco | symbol=%s timeframe=%s score=%s setup_score=%s warnings=%s",
                             symbol,
@@ -4931,27 +5156,21 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                             setup['score'],
                             ', '.join(setup['warnings'])
                         )
-                        _register_monitor_block(symbol, timeframe, signal, f"setup fraco (score {setup['score']}/{min_setup_score})", rank=probability)
                         continue
 
                 adx_val = setup.get('adx', 0.0)
-                if not weekend_mode and adx_val < 12:
-                    logger.info(
-                        f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: ADX baixo | adx={adx_val:.1f}<12"
-                    )
+                if not weekend_mode and adx_val < 15:
                     logger.info(
                         "Sinal bloqueado por ADX muito fraco | symbol=%s adx=%.1f timeframe=%s",
                         symbol, adx_val, timeframe,
                     )
-                    _register_monitor_block(symbol, timeframe, signal, f"ADX muito fraco ({adx_val:.1f} < 12)", rank=probability)
                     continue
 
-                if not weekend_mode and adx_val < 12:
+                if not weekend_mode and adx_val < 18 and 'MACD acelerando' not in ' '.join(setup['confirmations']):
                     logger.info(
-                        "Sinal bloqueado | ADX muito fraco | symbol=%s adx=%.1f timeframe=%s",
+                        "Sinal bloqueado | ADX moderado sem MACD | symbol=%s adx=%.1f timeframe=%s",
                         symbol, adx_val, timeframe,
                     )
-                    _register_monitor_block(symbol, timeframe, signal, f"ADX muito fraco ({adx_val:.1f} < 12)", rank=probability)
                     continue
 
                 primary_trend = 0 if weekend_mode else get_primary_trend(exchange, market_symbol, timeframe)
@@ -5005,17 +5224,12 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     )
                 if not entry_decision['allowed']:
                     logger.info(
-                        f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: entry_decision.allowed=False | "
-                        f"reason={entry_decision['reason']}"
-                    )
-                    logger.info(
                         "Sinal descartado por filtro profissional | symbol=%s timeframe=%s direction=%s motivo=%s",
                         symbol,
                         timeframe,
                         'BUY' if signal == 1 else 'SELL',
                         entry_decision['reason'],
                     )
-                    _register_monitor_block(symbol, timeframe, signal, f"filtro profissional: {entry_decision['reason']}", rank=probability)
                     continue
 
                 next_candle = get_next_candle_start(now, timeframe)
@@ -5027,21 +5241,6 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     effective_pre_alert_min = max(0, min(pre_alert_min_seconds, MARTINGALE_REENTRY_MIN_SECONDS))
 
                 if seconds_to_next > effective_pre_alert_max or seconds_to_next < effective_pre_alert_min:
-                    if seconds_to_next < effective_pre_alert_min:
-                        logger.info(
-                            f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: janela perdida | "
-                            f"seconds_to_next={seconds_to_next:.1f}s < min={effective_pre_alert_min}s"
-                        )
-                        _register_monitor_block(symbol, timeframe, signal, "janela de entrada perdida (candidato aprovado tarde demais)", rank=probability)
-                        logger.info(
-                            "Candidato aprovado perdeu a janela de pre-alerta | symbol=%s timeframe=%s faltavam=%.1fs",
-                            symbol, timeframe, seconds_to_next,
-                        )
-                    else:
-                        logger.info(
-                            f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: janela cedo demais | "
-                            f"seconds_to_next={seconds_to_next:.1f}s > max={effective_pre_alert_max}s"
-                        )
                     continue
 
                 pre_alert_key = f"{symbol_key}:{signal}:{next_candle.strftime('%Y%m%d%H%M')}"
@@ -5174,14 +5373,21 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Erro ao monitorar {symbol}: {e}")
     
     if alert_to_send:
+        sent_ok = True
         if chat_id:
-            await context.bot.send_message(
+            sent_ok = await _safe_send_message(
+                context.bot,
                 chat_id=chat_id,
                 text=alert_to_send['message'],
                 parse_mode='Markdown'
             )
-            monitor_last_alert_at = now
-            monitor_last_heartbeat_at = now
+            if sent_ok:
+                monitor_last_alert_at = now
+                monitor_last_heartbeat_at = now
+
+        if not sent_ok:
+            logger.warning('Sinal detectado mas não enviado por falha de rede Telegram | symbol=%s', alert_to_send['symbol'])
+            return
 
         monitor_signals_sent += 1
 
@@ -5230,22 +5436,31 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
         )
 
         if monitor_signals_sent >= MONITOR_MAX_SIGNALS and not pending_signal_evaluations:
-            monitoring_active = False
-            monitor_end_time = None
-            monitor_target_chat_id = None
-            monitor_started_at = None
-            monitor_last_alert_at = None
-            monitor_last_heartbeat_at = None
-            if chat_id:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "⏹ **Monitoramento finalizado automaticamente**\n\n"
-                        f"Limite de {MONITOR_MAX_SIGNALS} sinais atingido.\n"
-                        "Use /monitor on para iniciar um novo ciclo."
-                    ),
-                    parse_mode='Markdown'
-                )
+            if MONITOR_CONTINUOUS_MODE:
+                roll_monitor_cycle(now)
+                if chat_id:
+                    await _safe_send_message(
+                        context.bot,
+                        chat_id=chat_id,
+                        text=(
+                            "🔁 Monitor contínuo: limite de sinais do ciclo atingido\n\n"
+                            f"Novo ciclo iniciado automaticamente (limite por ciclo: {MONITOR_MAX_SIGNALS})."
+                        ),
+                        parse_mode='Markdown'
+                    )
+            else:
+                stop_monitoring_session()
+                if chat_id:
+                    await _safe_send_message(
+                        context.bot,
+                        chat_id=chat_id,
+                        text=(
+                            "⏹ **Monitoramento finalizado automaticamente**\n\n"
+                            f"Limite de {MONITOR_MAX_SIGNALS} sinais atingido.\n"
+                            "Use /monitor on para iniciar um novo ciclo."
+                        ),
+                        parse_mode='Markdown'
+                    )
     elif chat_id and MONITOR_HEARTBEAT_SECONDS > 0:
         should_send_heartbeat = False
         if monitor_last_heartbeat_at is None:
@@ -5263,7 +5478,8 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
 
             idle_min = idle_seconds // 60
             idle_sec = idle_seconds % 60
-            await context.bot.send_message(
+            await _safe_send_message(
+                context.bot,
                 chat_id=chat_id,
                 text=(
                     "📡 Monitor ativo (sem novo sinal ainda)\n"
@@ -5271,11 +5487,9 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     f"📊 Ativos monitorados: {len(monitored_symbols)}\n"
                     f"🕒 Último sinal há: {idle_min}m {idle_sec}s\n"
                     f"📌 Sinais enviados: {monitor_signals_sent}/{MONITOR_MAX_SIGNALS}"
-                    + _build_heartbeat_funnel_text()
                 )
             )
             monitor_last_heartbeat_at = now
-            _reset_heartbeat_funnel_stats()
 
 
 def main():
@@ -5348,6 +5562,7 @@ def main():
     application.add_handler(CommandHandler("pocket_recent", pocket_recent_command))
     application.add_handler(CommandHandler("pocket_compare", pocket_compare_command))
     application.add_handler(CommandHandler("pocket_help", pocket_help_command))
+    application.add_error_handler(telegram_error_handler)
     
     # Job queue para monitoramento e avaliação de sinais pendentes
     job_queue = application.job_queue

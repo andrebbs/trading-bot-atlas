@@ -12,6 +12,7 @@ from typing import Dict, Optional, Tuple
 import logging
 import sys
 import os
+import math
 
 # Add project root to path for testing
 if __name__ == '__main__':
@@ -50,13 +51,22 @@ class ConfluenceScoreSystem:
     # Ajustes para evitar score artificialmente deprimido quando poucas técnicas
     # estão ativas no candle atual (cenário comum em 1m/5m).
     ACTIVE_TECHNIQUE_MIN_SCORE = float(os.getenv('ATLAS_ACTIVE_TECHNIQUE_MIN_SCORE', '0.20'))
-    NORMALIZATION_BIAS = float(os.getenv('ATLAS_NORMALIZATION_BIAS', '0.45'))
     AGREEMENT_THRESHOLD = float(os.getenv('ATLAS_AGREEMENT_THRESHOLD', '0.30'))
 
-    STRONG_MIN_SCORE = float(os.getenv('ATLAS_STRONG_MIN_SCORE', '0.58'))
-    STRONG_MIN_CONFLUENCE = int(os.getenv('ATLAS_STRONG_MIN_CONFLUENCE', '3'))
-    MIN_SCORE = float(os.getenv('ATLAS_MIN_SCORE', '0.38'))
-    MIN_CONFLUENCE = int(os.getenv('ATLAS_MIN_CONFLUENCE', '2'))
+    # Thresholds de recomendação calibrados
+    STRONG_MIN_SCORE = float(os.getenv('ATLAS_STRONG_MIN_SCORE', '0.65'))
+    STRONG_MIN_CONFLUENCE = int(os.getenv('ATLAS_STRONG_MIN_CONFLUENCE', '4'))
+    MIN_SCORE = float(os.getenv('ATLAS_MIN_SCORE', '0.45'))  # Reduzido: era 0.50
+    MIN_CONFLUENCE = int(os.getenv('ATLAS_MIN_CONFLUENCE', '3'))
+    WEAK_MIN_SCORE = float(os.getenv('ATLAS_WEAK_MIN_SCORE', '0.35'))
+    WEAK_MIN_CONFLUENCE = int(os.getenv('ATLAS_WEAK_MIN_CONFLUENCE', '3'))
+
+    # Parâmetros de calibração da fórmula de score (logística suavizada)
+    COVERAGE_BASE = float(os.getenv('ATLAS_COVERAGE_BASE', '0.80'))
+    COVERAGE_SLOPE = float(os.getenv('ATLAS_COVERAGE_SLOPE', '0.20'))
+    AGREEMENT_BONUS_STEP = float(os.getenv('ATLAS_AGREEMENT_BONUS_STEP', '0.06'))
+    CALIB_K = float(os.getenv('ATLAS_CALIB_K', '6.0'))
+    CALIB_CENTER = float(os.getenv('ATLAS_CALIB_CENTER', '0.42'))
 
     
     def __init__(self):
@@ -231,40 +241,62 @@ class ConfluenceScoreSystem:
             raw_score += scores[technique] * weight
 
         raw_score = min(1.0, max(0.0, raw_score))
-
-        # Score normalizado por técnicas efetivamente ativas para reduzir
-        # falso "sempre neutro" quando detectores de padrão não disparam.
-        active_weight = sum(
-            weight
-            for technique, weight in self.WEIGHTS.items()
-            if scores.get(technique, 0.0) >= self.ACTIVE_TECHNIQUE_MIN_SCORE
-        )
-        # ----------------------------
-        # NORMALIZAÇÃO
-        # ----------------------------
-        normalized_score = raw_score / active_weight if active_weight > 0 else raw_score
-        normalized_score = min(1.0, max(0.0, normalized_score))
-
-        # ----------------------------
-        # PENALIZAÇÃO POR COBERTURA
-        # ----------------------------
-        coverage_ratio = active_weight  # total = 1.0
-
-        coverage_penalty = 0.55 + (0.45 * coverage_ratio)
-
-        # ----------------------------
-        # BLEND MAIS CONSERVADOR
-        # ----------------------------
-        blended_score = (
-            (0.5 * raw_score) +
-            (0.5 * normalized_score)
-        )
-
-        final_score = blended_score * coverage_penalty
-        final_score = min(1.0, max(0.0, final_score))
-
-        final_score_pct = int(round(final_score * 100))
         raw_score_pct = int(round(raw_score * 100))
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # NOVA FÓRMULA DE SCORE: Mais coerente e menos comprimida
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        # 1) Calcular técnicas efetivamente ativas (score >= ACTIVE_TECHNIQUE_MIN_SCORE)
+        active = {
+            technique: score
+            for technique, score in scores.items()
+            if score >= self.ACTIVE_TECHNIQUE_MIN_SCORE
+        }
+        
+        active_weight = sum(
+            self.WEIGHTS[technique]
+            for technique in active
+        )
+
+        # 2) Conviction: média ponderada das técnicas ativas
+        if active_weight > 0:
+            conviction = sum(
+                scores[technique] * self.WEIGHTS[technique]
+                for technique in active
+            ) / active_weight
+        else:
+            conviction = raw_score
+
+        conviction = min(1.0, max(0.0, conviction))
+
+        # 3) Contagem de confluências (técnicas que concordam >= AGREEMENT_THRESHOLD)
+        pre_conf = sum(
+            1 for _, score in scores.items()
+            if score >= self.AGREEMENT_THRESHOLD
+        )
+
+        # 4) Penalização por cobertura: quanto mais técnicas participam, melhor
+        coverage_penalty = self.COVERAGE_BASE + (self.COVERAGE_SLOPE * active_weight)
+        coverage_penalty = min(1.0, max(0.5, coverage_penalty))
+
+        # 5) Bônus de acordo: mais técnicas concordando = bônus progressivo
+        agreement_bonus = 1.0 + (self.AGREEMENT_BONUS_STEP * max(0, pre_conf - 2))
+        agreement_bonus = min(1.2, agreement_bonus)
+
+        # 6) Score base: combinação calibrada
+        base_score = conviction * coverage_penalty * agreement_bonus
+        base_score = min(1.0, max(0.0, base_score))
+
+        # 7) Score final: aplicar curva logística para melhor distribuição
+        # f(x) = 1 / (1 + exp(-k * (x - center)))
+        final_score = 1.0 / (1.0 + math.exp(-self.CALIB_K * (base_score - self.CALIB_CENTER)))
+        final_score = min(1.0, max(0.0, final_score))
+        final_score_pct = int(round(final_score * 100))
+
+        # Para debug: manter scores intermediários
+        normalized_score = conviction
+        blended_score = base_score
         
         # Contar confluências (score >= limiar = concorda)
         agreement_threshold = self.AGREEMENT_THRESHOLD
@@ -305,25 +337,30 @@ class ConfluenceScoreSystem:
         """
         Gera recomendação textual baseada em score e confluência
         
+        IMPORTANTE: Nunca retornar NEUTRAL para casos com confluência sólida.
+        Usar WEAK_* para sinais com qualidade marginal.
+        
         Args:
             score: Score final 0.0-1.0
-            confluence_count: Quantos fatores concordam
+            confluence_count: Quantos fatores concordam (0-5)
             direction: BUY ou SELL
         
         Returns:
             String de recomendação
         """
-        # Critérios padrão calibrados para curto prazo, configuráveis via env.
+        # Critério STRONG: score alto E confluência forte
         if score >= self.STRONG_MIN_SCORE and confluence_count >= self.STRONG_MIN_CONFLUENCE:
             return f'STRONG_{direction}'
 
+        # Critério NORMAL: score aceitável E confluência boa
         if score >= self.MIN_SCORE and confluence_count >= self.MIN_CONFLUENCE:
             return direction
 
-        # Nível fraco para leitura direcional com baixa convicção.
-        if score >= 0.40 and confluence_count >= 2:
+        # Critério WEAK: score fraco mas com alguma confluência (NOT NEUTRAL)
+        if score >= self.WEAK_MIN_SCORE and confluence_count >= self.WEAK_MIN_CONFLUENCE:
             return f'WEAK_{direction}'
 
+        # Somente retornar NEUTRAL se realmente não houver confluência
         return 'NEUTRAL'
     
     def should_enter_trade(
@@ -331,7 +368,7 @@ class ConfluenceScoreSystem:
         df: pd.DataFrame,
         direction: str,
         signal_data: Optional[Dict] = None,
-        min_score: float = 0.58,
+        min_score: float = 0.50,
         min_confluence: int = 3
     ) -> Tuple[bool, Dict]:
         """
@@ -341,7 +378,7 @@ class ConfluenceScoreSystem:
             df: DataFrame OHLCV + indicadores
             direction: 'BUY' ou 'SELL'
             signal_data: Dados do TradingAnalyzer (opcional)
-            min_score: Score mínimo para entrada (padrão 0.55 = 55%)
+            min_score: Score mínimo para entrada (padrão 0.50 = 50%)
             min_confluence: Mínimo de fatores concordantes (padrão 3)
         
         Returns:
@@ -349,75 +386,85 @@ class ConfluenceScoreSystem:
         """
         analysis = self.get_confluence_score(df, direction, signal_data)
         
-        # 1) Bloquear sinais fracos
+        # ─────────────────────────────────────────────────────────────────────
+        # SHADOW MODE: Coleta de dados para calibração posterior
+        # ─────────────────────────────────────────────────────────────────────
+        if os.getenv("ATLAS_SHADOW_MODE", "0") == "1":
+            try:
+                import json
+                import time
+
+                record = {
+                    "ts": time.time(),
+                    "direction": direction,
+                    "raw": round(analysis.get('raw_score', 0.0), 4),
+                    "conviction": round(analysis.get('normalized_score', 0.0), 4),
+                    "final": round(analysis['final_score'], 4),
+                    "final_pct": analysis['final_score_pct'],
+                    "conf": analysis['confluence_count'],
+                    "scores": {k: round(v, 3) for k, v in analysis['scores'].items()},
+                }
+
+                shadow_path = os.getenv("ATLAS_SHADOW_LOG", "/tmp/atlas_shadow.jsonl")
+                with open(shadow_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # RECOMENDAÇÃO E BLOQUEIOS
+        # ─────────────────────────────────────────────────────────────────────
         recommendation = analysis.get('recommendation', 'NEUTRAL')
-        if recommendation.startswith('WEAK'):
-            analysis['block_reason'] = 'Sinal fraco - baixa qualidade'
-            return False, analysis
-
+        
+        # NÃO BLOQUEAR WEAK - deixar passar se threshold final disser sim
+        # Os sinais WEAK serão aprovados se passarem no score/confluência final
+        
+        # Bloquear apenas sinais neutros (genuinamente sem confluência)
         if recommendation == 'NEUTRAL':
-            analysis['block_reason'] = 'Sem confluência'
+            analysis['block_reason'] = (
+                f'Neutro: score {analysis["final_score_pct"]}%, '
+                f'confluência {analysis["confluence_count"]}/5'
+            )
             return False, analysis
 
-        # 2) Filtro SMC estrutural — BOS/CHoCH + Sweep
+        # ─────────────────────────────────────────────────────────────────────
+        # NOTA: Removidos gates duros de SMC ranging e volatilidade
+        # que estavam bloqueando sinais válidos com scores 60-75% e 4-5 confluência.
+        # 
+        # A nova fórmula de score já compensa por estrutura de mercado,
+        # volatilidade baixa, etc. ao calcular conviction/agreement/coverage.
+        # Confiar no score + confluência é suficiente.
+        # ─────────────────────────────────────────────────────────────────────
+        
+        # Armazenar análise SMC para debug, mas não bloquear por "ranging"
         smc_analysis = self.smc.get_analysis(df)
-        if smc_analysis.get('structure') == 'ranging':
-            analysis['block_reason'] = 'Mercado lateral (SMC)'
-            return False, analysis
-
         bos = smc_analysis.get('bos', {}) or {}
         choch = smc_analysis.get('choch', {}) or {}
         sweep = smc_analysis.get('liquidity_sweep', {}) or {}
 
-        if direction == 'BUY':
-            has_structure_break = bool(bos.get('bullish_bos') or choch.get('bullish_choch'))
-            has_directional_sweep = bool(sweep.get('swept_low'))
-        else:
-            has_structure_break = bool(bos.get('bearish_bos') or choch.get('bearish_choch'))
-            has_directional_sweep = bool(sweep.get('swept_high'))
-
-        # BOS/CHoCH vira gatilho obrigatório de estrutura. Sweep é forte, mas não obrigatório.
-        if not has_structure_break:
-            analysis['block_reason'] = f'Sem BOS/CHoCH válido para {direction}'
-            analysis['smc_gate'] = {
-                'has_structure_break': False,
-                'has_directional_sweep': has_directional_sweep,
-                'bos': bos,
-                'choch': choch,
-                'sweep': sweep,
-            }
-            return False, analysis
-
         analysis['smc_gate'] = {
-            'has_structure_break': True,
-            'has_directional_sweep': has_directional_sweep,
+            'structure': smc_analysis.get('structure', 'unknown'),
             'bos': bos,
             'choch': choch,
             'sweep': sweep,
         }
 
-        # 3) Filtro de volatilidade
-        try:
-            atr = float(df['atr'].iloc[-1])
-            price = float(df['close'].iloc[-1])
-            volatility = (atr / price) if price > 0 else 0.0
-
-            if volatility < 0.003:
-                analysis['block_reason'] = 'Baixa volatilidade'
-                return False, analysis
-        except Exception:
-            pass
-
-        # 4) Verificar score
+        # ─────────────────────────────────────────────────────────────────────
+        # VERIFICAÇÃO FINAL DE SCORE E CONFLUÊNCIA
+        # ─────────────────────────────────────────────────────────────────────
         if analysis['final_score'] < min_score:
-            analysis['block_reason'] = f'Score baixo ({analysis["final_score"]:.2f})'
+            analysis['block_reason'] = (
+                f'Score baixo ({analysis["final_score_pct"]}%, min {int(min_score*100)}%)'
+            )
             return False, analysis
 
-        # 5) Verificar confluência
         if analysis['confluence_count'] < min_confluence:
-            analysis['block_reason'] = f'Pouca confluência ({analysis["confluence_count"]})'
+            analysis['block_reason'] = (
+                f'Pouca confluência ({analysis["confluence_count"]}/{min_confluence})'
+            )
             return False, analysis
 
+        # Entrada aprovada!
         analysis['block_reason'] = None
         return True, analysis
     

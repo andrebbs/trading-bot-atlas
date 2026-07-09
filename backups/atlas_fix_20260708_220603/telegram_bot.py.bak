@@ -2429,15 +2429,15 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
 
         # ── Viés tático scalp ───────────────────────────────────
         tactical_lines = []
-        if adx < 12:
+        if adx < 15:
             bullish_t = stoch_k > stoch_d and stoch_k < 35 and close >= ema9
             bearish_t = stoch_k < stoch_d and stoch_k > 65 and close <= ema9
             if bullish_t:
                 tactical_lines.append("🟢 *Viés tático (scalp):* compra de curto prazo possível")
-                tactical_lines.append("• Condições: ADX muito fraco + Stoch cruzando para cima em região descontada")
+                tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para cima em região descontada")
             elif bearish_t:
                 tactical_lines.append("🔴 *Viés tático (scalp):* venda de curto prazo possível")
-                tactical_lines.append("• Condições: ADX muito fraco + Stoch cruzando para baixo em região esticada")
+                tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para baixo em região esticada")
 
         if tactical_lines:
             message += "\n" + "\n".join(tactical_lines) + "\n"
@@ -2900,12 +2900,7 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _signal_quality_consensus(signal_data: dict, signal: int) -> int:
-    """Retorna consenso: preferir confluência ATLAS se disponível, senão contar indicadores técnicos."""
-    # Se o sinal foi aprovado pelo ATLAS, usar a confluência ATLAS (que é 3-5)
-    if 'confluence_count' in signal_data and signal != 0:
-        return int(signal_data.get('confluence_count', 0))
-    
-    # Fallback: contar indicadores técnicos concordando
+    """Conta quantos indicadores direcionais concordam com o sinal."""
     directional_scores = [
         float(signal_data.get('rsi_score', 0.0)),
         float(signal_data.get('macd_score', 0.0)),
@@ -4368,23 +4363,13 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                         current_price = float(df_live.iloc[-1]['close'])
 
                     entry_price = float(pending.get('entry_price') or current_price)
-                    # Safe conversion: handle 'NEUTRAL' string and other edge cases
-                    pending_signal_val = pending['signal']
-                    if isinstance(pending_signal_val, str) and pending_signal_val == 'NEUTRAL':
-                        pending_signal = 0
-                    else:
-                        pending_signal = int(pending_signal_val) if pending_signal_val else 0
+                    pending_signal = int(pending['signal'])
                     is_losing_now = (
                         current_price < entry_price if pending_signal == 1 else current_price > entry_price
                     )
 
                     if is_losing_now:
-                        # Safe conversion: handle 'NEUTRAL' string and other edge cases
-                        weekend_signal_val = weekend_setup['signal']
-                        if isinstance(weekend_signal_val, str) and weekend_signal_val == 'NEUTRAL':
-                            signal = 0
-                        else:
-                            signal = int(weekend_signal_val) if weekend_signal_val else 0
+                        signal = int(weekend_setup['signal'])
                         setup_score = int(weekend_setup['score'])
                         probability = float(weekend_setup['probability'])
                         score = max(float(signal_data.get('score', 0.5)), float(setup_score) / 10.0)
@@ -4688,27 +4673,14 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                 current_price = ticker['last'] if ticker else closed_df.iloc[-1]['close']
 
                 if weekend_setup is not None:
-                    # Safe conversion: handle 'NEUTRAL' string and other edge cases
-                    weekend_signal_val = weekend_setup['signal']
-                    if isinstance(weekend_signal_val, str) and weekend_signal_val == 'NEUTRAL':
-                        signal = 0
-                    else:
-                        signal = int(weekend_signal_val) if weekend_signal_val else 0
+                    signal = int(weekend_setup['signal'])
                     score = max(
                         float(signal_data.get('score', 0.5)),
                         float(weekend_setup['score']) / 10.0,
                     )
                     signal_data['probability'] = float(weekend_setup['probability'])
                 else:
-                    # ⚠️ IMPORTANTE: analyzer.get_current_signal() retorna signal como STRING ("BUY"/"SELL"/"NEUTRAL")
-                    # Converter para número (1/-1/0) para compatibilidade com lógica abaixo
-                    signal_str = signal_data['signal']
-                    if signal_str == 'BUY':
-                        signal = 1
-                    elif signal_str == 'SELL':
-                        signal = -1
-                    else:
-                        signal = 0
+                    signal = signal_data['signal']
                     score = signal_data['score']
                 symbol_key = get_monitor_signal_scope_key(symbol, timeframe)
                 monitor_analysis_count['analyzed'] += 1
@@ -4721,17 +4693,10 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                 try:
                     direction_str = 'BUY' if signal == 1 else 'SELL' if signal == -1 else 'NEUTRAL'
                     
-                    # ⚠️ IMPORTANTE: PULAR se não há direção (signal == 0)
-                    # ATLAS só faz sentido para sinais com direção clara (BUY ou SELL)
-                    if signal == 0 or direction_str == 'NEUTRAL':
-                        logger.info(f'[ATLAS-SKIP] {symbol} {timeframe}: signal={signal} NEUTRAL, pulando ATLAS')
-                        continue  # pular este ativo
-                    
                     # Aplica thresholds baseados no tier de liquidez do ativo
                     crypto_profile = _get_crypto_signal_profile(symbol_base) if is_crypto else None
-                    # ⚠️ IMPORTANTE: usar SEMPRE o threshold do .env (MIN), não do profile (que é mais alto)
-                    min_score_threshold = float(os.getenv('ATLAS_MIN_SCORE', '0.45'))
-                    min_confluence_threshold = int(os.getenv('ATLAS_MIN_CONFLUENCE', '3'))
+                    min_score_threshold = crypto_profile['min_score'] if crypto_profile else 0.55
+                    min_confluence_threshold = 3  # 3 técnicas concordando (padrão para todos)
                     
                     # Análise de confluência completa
                     should_enter, confluence_analysis = confluence_system.should_enter_trade(
@@ -4843,20 +4808,9 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                 martingale_step = int(reentry_state.get('alerts_sent', 0)) if is_martingale_alert else 0
 
                 if not should_alert_direction or signal == 0:
-                    logger.info(
-                        f"[POST-ATLAS-DEBUG] {symbol} {timeframe} signal={signal}: "
-                        f"should_alert={should_alert_direction} | "
-                        f"symbol_key_in_last_signal={symbol_key in last_signal} | "
-                        f"last_signal_value={last_signal.get(symbol_key, 'N/A')} | "
-                        f"current_signal={signal} | "
-                        f"cooldown_elapsed={direction_cooldown_elapsed(symbol_key, signal, now, timeframe) if signal != 0 else 'N/A'}"
-                    )
                     continue
 
                 probability = float(signal_data.get('probability', 0.0))
-                # Se probability está em escala 0-1, converter para 0-100
-                if probability <= 1.0:
-                    probability = probability * 100.0
                 edge = abs(float(score) - 0.5)
                 consensus = _signal_quality_consensus(signal_data, signal)
                 atlas_score = float(signal_data.get('atlas_score', score))
@@ -4877,10 +4831,6 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 if probability < min_probability or edge < min_edge or consensus < min_consensus:
-                    logger.info(
-                        f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: qualidade | "
-                        f"prob={probability:.1f}%<{min_probability:.0f}% | edge={edge:.2f}<{min_edge:.2f} | cons={consensus}<{min_consensus}"
-                    )
                     _register_monitor_block(symbol, timeframe, signal, f"qualidade: prob {probability:.1f}%/{min_probability:.0f}% | edge {edge:.2f}/{min_edge:.2f} | consenso {consensus}/{min_consensus}", rank=probability)
                     continue
 
@@ -4920,10 +4870,6 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     setup = evaluate_signal_setup(closed_df, signal, signal_data, timeframe)
                     if setup['score'] < min_setup_score:
                         logger.info(
-                            f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: setup fraco | "
-                            f"score={setup['score']}<{min_setup_score}"
-                        )
-                        logger.info(
                             "Sinal descartado por setup fraco | symbol=%s timeframe=%s score=%s setup_score=%s warnings=%s",
                             symbol,
                             timeframe,
@@ -4937,21 +4883,18 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                 adx_val = setup.get('adx', 0.0)
                 if not weekend_mode and adx_val < 12:
                     logger.info(
-                        f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: ADX baixo | adx={adx_val:.1f}<12"
-                    )
-                    logger.info(
                         "Sinal bloqueado por ADX muito fraco | symbol=%s adx=%.1f timeframe=%s",
                         symbol, adx_val, timeframe,
                     )
                     _register_monitor_block(symbol, timeframe, signal, f"ADX muito fraco ({adx_val:.1f} < 12)", rank=probability)
                     continue
 
-                if not weekend_mode and adx_val < 12:
+                if not weekend_mode and adx_val < 15 and 'MACD acelerando' not in ' '.join(setup['confirmations']):
                     logger.info(
-                        "Sinal bloqueado | ADX muito fraco | symbol=%s adx=%.1f timeframe=%s",
+                        "Sinal bloqueado | ADX moderado sem MACD | symbol=%s adx=%.1f timeframe=%s",
                         symbol, adx_val, timeframe,
                     )
-                    _register_monitor_block(symbol, timeframe, signal, f"ADX muito fraco ({adx_val:.1f} < 12)", rank=probability)
+                    _register_monitor_block(symbol, timeframe, signal, f"ADX moderado ({adx_val:.1f} < 15) sem MACD acelerando", rank=probability)
                     continue
 
                 primary_trend = 0 if weekend_mode else get_primary_trend(exchange, market_symbol, timeframe)
@@ -5005,10 +4948,6 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     )
                 if not entry_decision['allowed']:
                     logger.info(
-                        f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: entry_decision.allowed=False | "
-                        f"reason={entry_decision['reason']}"
-                    )
-                    logger.info(
                         "Sinal descartado por filtro profissional | symbol=%s timeframe=%s direction=%s motivo=%s",
                         symbol,
                         timeframe,
@@ -5028,19 +4967,10 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
 
                 if seconds_to_next > effective_pre_alert_max or seconds_to_next < effective_pre_alert_min:
                     if seconds_to_next < effective_pre_alert_min:
-                        logger.info(
-                            f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: janela perdida | "
-                            f"seconds_to_next={seconds_to_next:.1f}s < min={effective_pre_alert_min}s"
-                        )
                         _register_monitor_block(symbol, timeframe, signal, "janela de entrada perdida (candidato aprovado tarde demais)", rank=probability)
                         logger.info(
                             "Candidato aprovado perdeu a janela de pre-alerta | symbol=%s timeframe=%s faltavam=%.1fs",
                             symbol, timeframe, seconds_to_next,
-                        )
-                    else:
-                        logger.info(
-                            f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: janela cedo demais | "
-                            f"seconds_to_next={seconds_to_next:.1f}s > max={effective_pre_alert_max}s"
                         )
                     continue
 

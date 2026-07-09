@@ -4680,7 +4680,15 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     )
                     signal_data['probability'] = float(weekend_setup['probability'])
                 else:
-                    signal = signal_data['signal']
+                    # ⚠️ IMPORTANTE: analyzer.get_current_signal() retorna signal como STRING ("BUY"/"SELL"/"NEUTRAL")
+                    # Converter para número (1/-1/0) para compatibilidade com lógica abaixo
+                    signal_str = signal_data['signal']
+                    if signal_str == 'BUY':
+                        signal = 1
+                    elif signal_str == 'SELL':
+                        signal = -1
+                    else:
+                        signal = 0
                     score = signal_data['score']
                 symbol_key = get_monitor_signal_scope_key(symbol, timeframe)
                 monitor_analysis_count['analyzed'] += 1

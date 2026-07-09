@@ -54,11 +54,11 @@ class ConfluenceScoreSystem:
     AGREEMENT_THRESHOLD = float(os.getenv('ATLAS_AGREEMENT_THRESHOLD', '0.30'))
 
     # Thresholds de recomendação calibrados
-    STRONG_MIN_SCORE = float(os.getenv('ATLAS_STRONG_MIN_SCORE', '0.62'))
+    STRONG_MIN_SCORE = float(os.getenv('ATLAS_STRONG_MIN_SCORE', '0.65'))
     STRONG_MIN_CONFLUENCE = int(os.getenv('ATLAS_STRONG_MIN_CONFLUENCE', '4'))
-    MIN_SCORE = float(os.getenv('ATLAS_MIN_SCORE', '0.50'))
+    MIN_SCORE = float(os.getenv('ATLAS_MIN_SCORE', '0.45'))  # Reduzido: era 0.50
     MIN_CONFLUENCE = int(os.getenv('ATLAS_MIN_CONFLUENCE', '3'))
-    WEAK_MIN_SCORE = float(os.getenv('ATLAS_WEAK_MIN_SCORE', '0.42'))
+    WEAK_MIN_SCORE = float(os.getenv('ATLAS_WEAK_MIN_SCORE', '0.35'))
     WEAK_MIN_CONFLUENCE = int(os.getenv('ATLAS_WEAK_MIN_CONFLUENCE', '3'))
 
     # Parâmetros de calibração da fórmula de score (logística suavizada)
@@ -416,15 +416,10 @@ class ConfluenceScoreSystem:
         # ─────────────────────────────────────────────────────────────────────
         recommendation = analysis.get('recommendation', 'NEUTRAL')
         
-        # Bloquear sinais fracos
-        if recommendation.startswith('WEAK'):
-            analysis['block_reason'] = (
-                f'Sinal fraco: score {analysis["final_score_pct"]}%, '
-                f'confluência {analysis["confluence_count"]}/5'
-            )
-            return False, analysis
-
-        # Bloquear sinais neutros
+        # NÃO BLOQUEAR WEAK - deixar passar se threshold final disser sim
+        # Os sinais WEAK serão aprovados se passarem no score/confluência final
+        
+        # Bloquear apenas sinais neutros (genuinamente sem confluência)
         if recommendation == 'NEUTRAL':
             analysis['block_reason'] = (
                 f'Neutro: score {analysis["final_score_pct"]}%, '
@@ -433,79 +428,26 @@ class ConfluenceScoreSystem:
             return False, analysis
 
         # ─────────────────────────────────────────────────────────────────────
-        # FILTRO SMC ESTRUTURAL: BOS/CHoCH + Sweep + Tendência via EMA
+        # NOTA: Removidos gates duros de SMC ranging e volatilidade
+        # que estavam bloqueando sinais válidos com scores 60-75% e 4-5 confluência.
+        # 
+        # A nova fórmula de score já compensa por estrutura de mercado,
+        # volatilidade baixa, etc. ao calcular conviction/agreement/coverage.
+        # Confiar no score + confluência é suficiente.
         # ─────────────────────────────────────────────────────────────────────
+        
+        # Armazenar análise SMC para debug, mas não bloquear por "ranging"
         smc_analysis = self.smc.get_analysis(df)
-        if smc_analysis.get('structure') == 'ranging':
-            analysis['block_reason'] = 'Mercado lateral (SMC ranging)'
-            return False, analysis
-
         bos = smc_analysis.get('bos', {}) or {}
         choch = smc_analysis.get('choch', {}) or {}
         sweep = smc_analysis.get('liquidity_sweep', {}) or {}
 
-        if direction == 'BUY':
-            has_structure_break = bool(bos.get('bullish_bos') or choch.get('bullish_choch'))
-            has_directional_sweep = bool(sweep.get('swept_low'))
-        else:
-            has_structure_break = bool(bos.get('bearish_bos') or choch.get('bearish_choch'))
-            has_directional_sweep = bool(sweep.get('swept_high'))
-
-        # Lógica suavizada: permitir entrada sem BOS/CHoCH se houver SWEEP + EMA alinhado
-        trend_aligned = False
-        try:
-            last = df.iloc[-1]
-            ema20 = float(last.get('ema_20', last.get('ema20', 0.0)) or 0.0)
-            ema50 = float(last.get('ema_50', last.get('ema50', 0.0)) or 0.0)
-
-            if direction == 'BUY':
-                trend_aligned = ema20 > ema50 > 0
-            else:
-                trend_aligned = 0 < ema20 < ema50
-        except Exception:
-            pass
-
-        # Gate: permitir entrada se PELO MENOS UM critério for satisfeito
-        if not (has_structure_break or has_directional_sweep or trend_aligned):
-            analysis['block_reason'] = f'Sem estrutura/sweep/tendência para {direction}'
-            analysis['smc_gate'] = {
-                'has_structure_break': has_structure_break,
-                'has_directional_sweep': has_directional_sweep,
-                'trend_aligned': trend_aligned,
-                'bos': bos,
-                'choch': choch,
-                'sweep': sweep,
-            }
-            return False, analysis
-
-        # Sucesso: armazenar gates para debug
         analysis['smc_gate'] = {
-            'has_structure_break': has_structure_break,
-            'has_directional_sweep': has_directional_sweep,
-            'trend_aligned': trend_aligned,
+            'structure': smc_analysis.get('structure', 'unknown'),
             'bos': bos,
             'choch': choch,
             'sweep': sweep,
         }
-
-        # Aplicar bônus pequeno se houver BOS/CHoCH (estrutura forte)
-        if has_structure_break:
-            analysis['final_score'] = min(1.0, analysis['final_score'] * 1.05)
-            analysis['final_score_pct'] = int(round(analysis['final_score'] * 100))
-
-        # ─────────────────────────────────────────────────────────────────────
-        # FILTRO DE VOLATILIDADE
-        # ─────────────────────────────────────────────────────────────────────
-        try:
-            atr = float(df['atr'].iloc[-1])
-            price = float(df['close'].iloc[-1])
-            volatility = (atr / price) if price > 0 else 0.0
-
-            if volatility < 0.003:
-                analysis['block_reason'] = 'Baixa volatilidade'
-                return False, analysis
-        except Exception:
-            pass
 
         # ─────────────────────────────────────────────────────────────────────
         # VERIFICAÇÃO FINAL DE SCORE E CONFLUÊNCIA

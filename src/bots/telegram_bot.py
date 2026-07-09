@@ -4693,14 +4693,15 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                 try:
                     direction_str = 'BUY' if signal == 1 else 'SELL' if signal == -1 else 'NEUTRAL'
                     
+                    # ⚠️ IMPORTANTE: PULAR se não há direção (signal == 0)
+                    # ATLAS só faz sentido para sinais com direção clara (BUY ou SELL)
+                    if signal == 0 or direction_str == 'NEUTRAL':
+                        continue  # pular este ativo
+                    
                     # Aplica thresholds baseados no tier de liquidez do ativo
                     crypto_profile = _get_crypto_signal_profile(symbol_base) if is_crypto else None
-                    min_score_threshold = float(os.getenv('ATLAS_MIN_SCORE', '0.50'))
-                    if crypto_profile:
-                        min_score_threshold = max(
-                            crypto_profile.get('min_score', 0.50),
-                            float(os.getenv('ATLAS_MIN_SCORE', '0.50'))
-                        )
+                    # ⚠️ IMPORTANTE: usar SEMPRE o threshold do .env (MIN), não do profile (que é mais alto)
+                    min_score_threshold = float(os.getenv('ATLAS_MIN_SCORE', '0.45'))
                     min_confluence_threshold = int(os.getenv('ATLAS_MIN_CONFLUENCE', '3'))
                     
                     # Análise de confluência completa

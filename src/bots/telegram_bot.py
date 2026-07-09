@@ -4696,6 +4696,7 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     # ⚠️ IMPORTANTE: PULAR se não há direção (signal == 0)
                     # ATLAS só faz sentido para sinais com direção clara (BUY ou SELL)
                     if signal == 0 or direction_str == 'NEUTRAL':
+                        logger.info(f'[ATLAS-SKIP] {symbol} {timeframe}: signal={signal} NEUTRAL, pulando ATLAS')
                         continue  # pular este ativo
                     
                     # Aplica thresholds baseados no tier de liquidez do ativo

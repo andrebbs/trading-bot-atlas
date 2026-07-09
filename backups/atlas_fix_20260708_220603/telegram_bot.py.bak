@@ -2429,15 +2429,15 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol=Non
 
         # ── Viés tático scalp ───────────────────────────────────
         tactical_lines = []
-        if adx < 12:
+        if adx < 15:
             bullish_t = stoch_k > stoch_d and stoch_k < 35 and close >= ema9
             bearish_t = stoch_k < stoch_d and stoch_k > 65 and close <= ema9
             if bullish_t:
                 tactical_lines.append("🟢 *Viés tático (scalp):* compra de curto prazo possível")
-                tactical_lines.append("• Condições: ADX muito fraco + Stoch cruzando para cima em região descontada")
+                tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para cima em região descontada")
             elif bearish_t:
                 tactical_lines.append("🔴 *Viés tático (scalp):* venda de curto prazo possível")
-                tactical_lines.append("• Condições: ADX muito fraco + Stoch cruzando para baixo em região esticada")
+                tactical_lines.append("• Condições: ADX baixo + Stoch cruzando para baixo em região esticada")
 
         if tactical_lines:
             message += "\n" + "\n".join(tactical_lines) + "\n"
@@ -4695,13 +4695,8 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     
                     # Aplica thresholds baseados no tier de liquidez do ativo
                     crypto_profile = _get_crypto_signal_profile(symbol_base) if is_crypto else None
-                    min_score_threshold = float(os.getenv('ATLAS_MIN_SCORE', '0.50'))
-                    if crypto_profile:
-                        min_score_threshold = max(
-                            crypto_profile.get('min_score', 0.50),
-                            float(os.getenv('ATLAS_MIN_SCORE', '0.50'))
-                        )
-                    min_confluence_threshold = int(os.getenv('ATLAS_MIN_CONFLUENCE', '3'))
+                    min_score_threshold = crypto_profile['min_score'] if crypto_profile else 0.55
+                    min_confluence_threshold = 3  # 3 técnicas concordando (padrão para todos)
                     
                     # Análise de confluência completa
                     should_enter, confluence_analysis = confluence_system.should_enter_trade(
@@ -4894,12 +4889,12 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     _register_monitor_block(symbol, timeframe, signal, f"ADX muito fraco ({adx_val:.1f} < 12)", rank=probability)
                     continue
 
-                if not weekend_mode and adx_val < 12:
+                if not weekend_mode and adx_val < 15 and 'MACD acelerando' not in ' '.join(setup['confirmations']):
                     logger.info(
-                        "Sinal bloqueado | ADX muito fraco | symbol=%s adx=%.1f timeframe=%s",
+                        "Sinal bloqueado | ADX moderado sem MACD | symbol=%s adx=%.1f timeframe=%s",
                         symbol, adx_val, timeframe,
                     )
-                    _register_monitor_block(symbol, timeframe, signal, f"ADX muito fraco ({adx_val:.1f} < 12)", rank=probability)
+                    _register_monitor_block(symbol, timeframe, signal, f"ADX moderado ({adx_val:.1f} < 15) sem MACD acelerando", rank=probability)
                     continue
 
                 primary_trend = 0 if weekend_mode else get_primary_trend(exchange, market_symbol, timeframe)

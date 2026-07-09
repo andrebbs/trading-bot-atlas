@@ -335,16 +335,6 @@ MIN_SIGNAL_CONSENSUS_1M = 2      # era 3
 MIN_SETUP_SCORE = 3     # era 4 — aceita setups mais fracos
 MIN_SETUP_SCORE_1M = 4  # era 6
 
-# Gates finais — Tolerância e compensação
-ATLAS_EDGE_TOLERANCE = float(os.getenv('ATLAS_EDGE_TOLERANCE', '0.005'))
-ATLAS_PROB_COMPENSATION = float(os.getenv('ATLAS_PROB_COMPENSATION', '5.0'))
-ATLAS_EDGE_COMPENSATION_FACTOR = float(os.getenv('ATLAS_EDGE_COMPENSATION_FACTOR', '0.50'))
-ATLAS_MIN_SETUP_SCORE = int(os.getenv('ATLAS_MIN_SETUP_SCORE', '4'))
-
-# Anti-spam por ativo
-MONITOR_MAX_SIGNALS_PER_SYMBOL_HOUR = int(os.getenv('MONITOR_MAX_SIGNALS_PER_SYMBOL_HOUR', '2'))
-monitor_symbol_signal_history = {}
-
 MONITOR_INDICATORS_CONFIG = {
     **config.INDICATORS_CONFIG,
     'ADX': {'period': 14},
@@ -1146,36 +1136,6 @@ def _register_monitor_block(symbol, timeframe, signal, reason, rank=0.0):
             })
     except Exception:
         pass
-
-
-def _prune_symbol_signal_history(symbol: str, now: datetime):
-    """Remove entradas de sinal antigo (>1 hora) para evitar vazamento de memória."""
-    try:
-        cutoff = now - timedelta(hours=1)
-        history = monitor_symbol_signal_history.get(symbol, [])
-        monitor_symbol_signal_history[symbol] = [t for t in history if t >= cutoff]
-    except Exception:
-        pass
-
-
-def _can_send_symbol_signal(symbol: str, now: datetime) -> bool:
-    """Verifica se ativo ainda tem cota de sinais nesta hora."""
-    try:
-        _prune_symbol_signal_history(symbol, now)
-        current_count = len(monitor_symbol_signal_history.get(symbol, []))
-        return current_count < MONITOR_MAX_SIGNALS_PER_SYMBOL_HOUR
-    except Exception:
-        return True  # Se erro, deixa passar
-
-
-def _register_symbol_signal_sent(symbol: str, now: datetime):
-    """Registra envio de sinal para ativo, incrementando contador."""
-    try:
-        _prune_symbol_signal_history(symbol, now)
-        monitor_symbol_signal_history.setdefault(symbol, []).append(now)
-    except Exception:
-        pass
-
 
 
 def _build_heartbeat_funnel_text() -> str:
@@ -4916,33 +4876,12 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     _register_monitor_block(symbol, timeframe, signal, "risco de falso rompimento", rank=probability)
                     continue
 
-                # Gate de qualidade com tolerância e compensação
-                edge_tolerance = ATLAS_EDGE_TOLERANCE
-                prob_compensation = ATLAS_PROB_COMPENSATION
-                edge_compensation_factor = ATLAS_EDGE_COMPENSATION_FACTOR
-                
-                quality_ok = (
-                    probability >= min_probability
-                    and edge >= (min_edge - edge_tolerance)
-                    and consensus >= min_consensus
-                )
-                
-                compensated_quality_ok = (
-                    probability >= (min_probability + prob_compensation)
-                    and consensus >= (min_consensus + 1)
-                    and edge >= (min_edge * edge_compensation_factor)
-                )
-                
-                if not (quality_ok or compensated_quality_ok):
-                    block_reason = (
-                        f"qualidade: prob {probability:.2f}%/{min_probability:.2f}% | "
-                        f"edge {edge:.4f}/{min_edge:.4f} | "
-                        f"consenso {consensus}/{min_consensus}"
-                    )
+                if probability < min_probability or edge < min_edge or consensus < min_consensus:
                     logger.info(
-                        f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: {block_reason}"
+                        f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: qualidade | "
+                        f"prob={probability:.1f}%<{min_probability:.0f}% | edge={edge:.2f}<{min_edge:.2f} | cons={consensus}<{min_consensus}"
                     )
-                    _register_monitor_block(symbol, timeframe, signal, block_reason, rank=probability)
+                    _register_monitor_block(symbol, timeframe, signal, f"qualidade: prob {probability:.1f}%/{min_probability:.0f}% | edge {edge:.2f}/{min_edge:.2f} | consenso {consensus}/{min_consensus}", rank=probability)
                     continue
 
                 if weekend_mode:
@@ -4979,23 +4918,10 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                         continue
                 else:
                     setup = evaluate_signal_setup(closed_df, signal, signal_data, timeframe)
-                    
-                    # Setup score adaptativo por timeframe e qualidade de sinal
-                    base_min_setup_score = ATLAS_MIN_SETUP_SCORE
-                    
-                    if timeframe_to_minutes(timeframe) <= 5:
-                        adaptive_min_setup_score = min(base_min_setup_score, 3)
-                    else:
-                        adaptive_min_setup_score = base_min_setup_score
-                    
-                    # Se prob/consenso muito fortes, relaxar score mínimo
-                    if probability >= 55 and consensus >= 4:
-                        adaptive_min_setup_score = max(2, adaptive_min_setup_score - 1)
-                    
-                    if setup['score'] < adaptive_min_setup_score:
-                        block_reason = f"setup fraco (score {setup['score']}/{adaptive_min_setup_score})"
+                    if setup['score'] < min_setup_score:
                         logger.info(
-                            f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: {block_reason}"
+                            f"[POST-ATLAS-DEBUG] {symbol} {timeframe} REJEITADO: setup fraco | "
+                            f"score={setup['score']}<{min_setup_score}"
                         )
                         logger.info(
                             "Sinal descartado por setup fraco | symbol=%s timeframe=%s score=%s setup_score=%s warnings=%s",
@@ -5005,7 +4931,7 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                             setup['score'],
                             ', '.join(setup['warnings'])
                         )
-                        _register_monitor_block(symbol, timeframe, signal, block_reason, rank=probability)
+                        _register_monitor_block(symbol, timeframe, signal, f"setup fraco (score {setup['score']}/{min_setup_score})", rank=probability)
                         continue
 
                 adx_val = setup.get('adx', 0.0)
@@ -5248,25 +5174,6 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Erro ao monitorar {symbol}: {e}")
     
     if alert_to_send:
-        # Verificação anti-spam por ativo
-        symbol = alert_to_send['symbol']
-        now_dt = datetime.now()
-        if not _can_send_symbol_signal(symbol, now_dt):
-            remaining = MONITOR_MAX_SIGNALS_PER_SYMBOL_HOUR - len(monitor_symbol_signal_history.get(symbol, []))
-            logger.info(
-                f"[ANTI-SPAM] {symbol} atingiu limite de sinais/hora ({MONITOR_MAX_SIGNALS_PER_SYMBOL_HOUR}). "
-                f"Próximo permitido em ~60min. (Candidato descartado)"
-            )
-            _register_monitor_block(
-                symbol, 
-                alert_to_send['timeframe'], 
-                alert_to_send['signal'],
-                "limite de sinais por ativo/hora",
-                rank=alert_to_send.get('rank', 0),
-            )
-            alert_to_send = None
-    
-    if alert_to_send:
         if chat_id:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -5277,9 +5184,6 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
             monitor_last_heartbeat_at = now
 
         monitor_signals_sent += 1
-        
-        # Registra envio para anti-spam
-        _register_symbol_signal_sent(alert_to_send['symbol'], now_dt)
 
         # Registra o sinal para avaliar no fechamento do candle seguinte
         pending_signal_evaluations.append({

@@ -46,6 +46,39 @@ bitget_executor = None
 
 def _now_str() -> str:
     from datetime import datetime
+
+
+def normalize_signal_value(value):
+    """
+    Normaliza direcao/sinal para o padrao interno:
+    BUY/COMPRA/CALL/LONG/1  -> 1
+    SELL/VENDA/PUT/SHORT/-1 -> -1
+    NEUTRAL/NEUTRO/0/None   -> 0
+    Evita crash: invalid literal for int() with base 10: 'NEUTRAL'
+    """
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        if value > 0:
+            return 1
+        if value < 0:
+            return -1
+        return 0
+    text = str(value).strip().upper()
+    if text in ("BUY", "COMPRA", "CALL", "LONG", "BULL", "BULLISH", "ALTA", "1"):
+        return 1
+    if text in ("SELL", "VENDA", "PUT", "SHORT", "BEAR", "BEARISH", "BAIXA", "-1"):
+        return -1
+    if text in ("NEUTRAL", "NEUTRO", "NONE", "NULL", "N/A", "NA", "", "0"):
+        return 0
+    try:
+        num = float(text)
+        return 1 if num > 0 else (-1 if num < 0 else 0)
+    except (ValueError, TypeError):
+        return 0
+
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 # ─────────────────────────────────────────────────────────────────
 
@@ -1015,7 +1048,7 @@ def evaluate_weekend_binary_setup(
     tf_minutes = timeframe_to_minutes(timeframe)
 
     if signal == 0 and signal_data is not None and tf_minutes <= 1:
-        continuation_signal = int(signal_data.get('signal', 0))
+        continuation_signal = normalize_signal_value(signal_data.get('signal', 0))
         continuation_score_hint = float(signal_data.get('score', 0.5))
 
         if continuation_signal == 0:
@@ -1048,7 +1081,7 @@ def evaluate_weekend_binary_setup(
                 warnings.append('scalp weekend: setup de continuidade curta, aceitar no maximo 2 martingales')
 
     if signal == 0 and signal_data is not None and tf_minutes >= 5:
-        continuation_signal = int(signal_data.get('signal', 0))
+        continuation_signal = normalize_signal_value(signal_data.get('signal', 0))
         continuation_score_hint = float(signal_data.get('score', 0.5))
 
         if continuation_signal == 0:
@@ -1139,7 +1172,7 @@ def _register_monitor_block(symbol, timeframe, signal, reason, rank=0.0):
             monitor_best_candidate.update({
                 'symbol': symbol,
                 'timeframe': timeframe,
-                'signal': int(signal),
+                'signal': normalize_signal_value(signal),
                 'reason': reason,
                 'rank': float(rank),
                 'at': datetime.now(),
@@ -4413,7 +4446,7 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     if isinstance(pending_signal_val, str) and pending_signal_val == 'NEUTRAL':
                         pending_signal = 0
                     else:
-                        pending_signal = int(pending_signal_val) if pending_signal_val else 0
+                        pending_signal = normalize_signal_value(pending_signal_val) if pending_signal_val else 0
                     is_losing_now = (
                         current_price < entry_price if pending_signal == 1 else current_price > entry_price
                     )
@@ -4424,7 +4457,7 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                         if isinstance(weekend_signal_val, str) and weekend_signal_val == 'NEUTRAL':
                             signal = 0
                         else:
-                            signal = int(weekend_signal_val) if weekend_signal_val else 0
+                            signal = normalize_signal_value(weekend_signal_val) if weekend_signal_val else 0
                         setup_score = int(weekend_setup['score'])
                         probability = float(weekend_setup['probability'])
                         score = max(float(signal_data.get('score', 0.5)), float(setup_score) / 10.0)
@@ -4733,7 +4766,7 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     if isinstance(weekend_signal_val, str) and weekend_signal_val == 'NEUTRAL':
                         signal = 0
                     else:
-                        signal = int(weekend_signal_val) if weekend_signal_val else 0
+                        signal = normalize_signal_value(weekend_signal_val) if weekend_signal_val else 0
                     score = max(
                         float(signal_data.get('score', 0.5)),
                         float(weekend_setup['score']) / 10.0,
@@ -5490,3 +5523,166 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# =============================================================================
+# ATLAS INTELLIGENT SCANNER — 2026-07-12
+# Added as an isolated module to avoid changing existing analysis/monitor flows.
+# Register it in the Telegram Application with: register_atlas_intelligent_scanner(application)
+# =============================================================================
+import json as _atlas_scanner_json
+from pathlib import Path as _AtlasScannerPath
+from datetime import datetime as _AtlasScannerDatetime, timezone as _AtlasScannerTimezone
+
+ATLAS_SCANNER_CONFIG = {
+    "enabled": False,
+    "interval_seconds": 300,
+    "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+    "timeframe": "5m",
+    "min_score": 0.58,
+    "cooldown_seconds": 900,
+    "output_dir": "scanner_outputs",
+}
+ATLAS_SCANNER_LAST_ALERT = {}
+
+def _atlas_scanner_now():
+    return _AtlasScannerDatetime.now(_AtlasScannerTimezone.utc)
+
+def _atlas_scanner_output_dir():
+    path = _AtlasScannerPath(ATLAS_SCANNER_CONFIG["output_dir"])
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def _atlas_scanner_normalize(symbol, raw):
+    """Normalizes results returned by the project's existing analysis engine."""
+    raw = raw or {}
+    if not isinstance(raw, dict):
+        raw = {"raw": str(raw)}
+    score = raw.get("score", raw.get("confluence_score", raw.get("total_score", 0)))
+    try:
+        score = float(score or 0)
+        if score > 1:  # Existing bot commonly uses percentage scores (0..100).
+            score /= 100.0
+    except (TypeError, ValueError):
+        score = 0.0
+    signal = str(raw.get("signal", raw.get("classification", raw.get("recommendation", raw.get("direction", "NEUTRAL"))))).upper()
+    aliases = {"COMPRA": "BUY", "VENDA": "SELL", "LONG": "BUY", "SHORT": "SELL", "NEUTRO": "NEUTRAL"}
+    signal = aliases.get(signal, signal)
+    confidence = raw.get("confidence", raw.get("probability", score))
+    try:
+        confidence = float(confidence or score)
+        if confidence > 1:
+            confidence /= 100.0
+    except (TypeError, ValueError):
+        confidence = score
+    return {"symbol": symbol, "score": round(score, 4), "signal": signal, "confidence": round(confidence, 4), "raw": raw}
+
+def _atlas_scanner_analyze(symbol):
+    """Uses a compatible existing analyzer when found; never creates a random/mock signal."""
+    candidates = ("analyze_asset", "analyze_symbol", "run_analysis", "get_analysis", "generate_signal")
+    last_error = None
+    for name in candidates:
+        fn = globals().get(name)
+        if not callable(fn):
+            continue
+        for args in ((symbol, ATLAS_SCANNER_CONFIG["timeframe"]), (symbol,), ()):
+            try:
+                return _atlas_scanner_normalize(symbol, fn(*args))
+            except TypeError:
+                continue
+            except Exception as exc:
+                last_error = str(exc)
+                break
+    return {"symbol": symbol, "score": 0.0, "signal": "NEUTRAL", "confidence": 0.0,
+            "raw": {}, "error": last_error or "Nenhuma função de análise compatível encontrada"}
+
+def _atlas_scanner_save(result):
+    stamp = _atlas_scanner_now().strftime("%Y%m%d_%H%M%S")
+    safe_symbol = re.sub(r"[^A-Za-z0-9_-]+", "_", result.get("symbol", "unknown"))
+    path = _atlas_scanner_output_dir() / f"scan_{safe_symbol}_{stamp}.json"
+    payload = {k: v for k, v in result.items() if k != "raw"}
+    payload["timestamp_utc"] = _atlas_scanner_now().isoformat()
+    with path.open("w", encoding="utf-8") as fp:
+        _atlas_scanner_json.dump(payload, fp, ensure_ascii=False, indent=2, default=str)
+    return str(path)
+
+def _atlas_scanner_can_alert(result):
+    if result.get("signal") not in {"BUY", "SELL"}:
+        return False
+    if float(result.get("score", 0)) < float(ATLAS_SCANNER_CONFIG["min_score"]):
+        return False
+    key = f"{result.get('symbol')}:{result.get('signal')}"
+    now = _atlas_scanner_now().timestamp()
+    if now - ATLAS_SCANNER_LAST_ALERT.get(key, 0) < int(ATLAS_SCANNER_CONFIG["cooldown_seconds"]):
+        return False
+    ATLAS_SCANNER_LAST_ALERT[key] = now
+    return True
+
+async def atlas_intelligent_scanner_job(context):
+    """Scheduled cycle: scans configured assets, writes JSON diagnostics, alerts qualified signals."""
+    if not ATLAS_SCANNER_CONFIG["enabled"]:
+        return
+    chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
+    for symbol in list(ATLAS_SCANNER_CONFIG["symbols"]):
+        result = _atlas_scanner_analyze(symbol)
+        result["file"] = _atlas_scanner_save(result)
+        logger.info("ATLAS scanner | %s | %s | score=%.2f | %s", symbol, result["signal"], result["score"], result["file"])
+        if chat_id and _atlas_scanner_can_alert(result):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=("🔎 *ATLAS Scanner Inteligente*\n"
+                      f"Ativo: `{symbol}`\nSinal: *{result['signal']}*\n"
+                      f"Score: *{result['score']:.0%}*\n"
+                      f"Timeframe: `{ATLAS_SCANNER_CONFIG['timeframe']}`"),
+                parse_mode="Markdown",
+            )
+
+async def scanner_command(update, context):
+    """Telegram: /scanner on|off|status|intervalo 5|ativos BTC/USDT,ETH/USDT|timeframe 5m|agora"""
+    args = list(getattr(context, "args", []) or [])
+    command = args[0].lower() if args else "status"
+    if command == "on":
+        ATLAS_SCANNER_CONFIG["enabled"] = True
+        message = "✅ Scanner Inteligente ativado."
+    elif command == "off":
+        ATLAS_SCANNER_CONFIG["enabled"] = False
+        message = "⛔ Scanner Inteligente desativado."
+    elif command in {"intervalo", "interval"} and len(args) >= 2:
+        try:
+            minutes = max(1, int(args[1]))
+            ATLAS_SCANNER_CONFIG["interval_seconds"] = minutes * 60
+            jq = getattr(context.application, "job_queue", None)
+            if jq:
+                for job in jq.get_jobs_by_name("atlas_intelligent_scanner"):
+                    job.schedule_removal()
+                jq.run_repeating(atlas_intelligent_scanner_job, interval=minutes * 60, first=5, name="atlas_intelligent_scanner")
+            message = f"⏱ Intervalo alterado para {minutes} minuto(s)."
+        except ValueError:
+            message = "Uso: /scanner intervalo 5"
+    elif command in {"ativos", "symbols"} and len(args) >= 2:
+        symbols = [x.strip().upper() for x in " ".join(args[1:]).split(",") if x.strip()]
+        ATLAS_SCANNER_CONFIG["symbols"] = symbols
+        message = "✅ Ativos: " + ", ".join(symbols)
+    elif command in {"timeframe", "tf"} and len(args) >= 2:
+        ATLAS_SCANNER_CONFIG["timeframe"] = args[1]
+        message = f"✅ Timeframe: {args[1]}"
+    elif command in {"agora", "now"}:
+        await atlas_intelligent_scanner_job(context)
+        message = "🔎 Ciclo executado. Consulte scanner_outputs para os diagnósticos JSON."
+    else:
+        enabled = "ON ✅" if ATLAS_SCANNER_CONFIG["enabled"] else "OFF ❌"
+        message = (f"*Scanner:* {enabled}\nIntervalo: {ATLAS_SCANNER_CONFIG['interval_seconds']//60} min\n"
+                   f"Timeframe: {ATLAS_SCANNER_CONFIG['timeframe']}\n"
+                   f"Score mínimo: {ATLAS_SCANNER_CONFIG['min_score']:.0%}\n"
+                   f"Ativos: {', '.join(ATLAS_SCANNER_CONFIG['symbols'])}\n\n"
+                   "Uso: `/scanner on|off|status|intervalo 5|ativos BTC/USDT,ETH/USDT|timeframe 5m|agora`")
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+def register_atlas_intelligent_scanner(application):
+    """Call once after the Telegram Application is created."""
+    from telegram.ext import CommandHandler
+    application.add_handler(CommandHandler("scanner", scanner_command))
+    jq = getattr(application, "job_queue", None)
+    if jq:
+        for job in jq.get_jobs_by_name("atlas_intelligent_scanner"):
+            job.schedule_removal()
+        jq.run_repeating(atlas_intelligent_scanner_job, interval=ATLAS_SCANNER_CONFIG["interval_seconds"], first=10, name="atlas_intelligent_scanner")

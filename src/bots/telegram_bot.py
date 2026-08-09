@@ -10,6 +10,7 @@ import json
 import logging
 import time
 import re
+import asyncio
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -19,6 +20,7 @@ import fcntl
 import numpy as np
 import pandas as pd
 from telegram import Update
+from telegram.helpers import escape_markdown
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -43,6 +45,17 @@ except Exception:
 
 BITGET_EXECUTOR_ENABLED = False
 bitget_executor = None
+
+# NovaDexy stays off unless explicitly enabled; it accepts only dry_run/demo.
+NOVADEXY_EXECUTOR_ENABLED = os.getenv('NOVADEXY_EXECUTOR_ENABLED', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
+novadexy_executor = None
+if NOVADEXY_EXECUTOR_ENABLED:
+    try:
+        from src.core.novadexy_executor import get_executor as _get_novadexy_executor
+        novadexy_executor = _get_novadexy_executor()
+    except Exception as _err:
+        logger.warning('NovaDexy executor indisponível: %s', _err)
+        NOVADEXY_EXECUTOR_ENABLED = False
 
 def _now_str() -> str:
     from datetime import datetime
@@ -153,6 +166,82 @@ def _env_flag(raw_value: str | None, default: bool = False) -> bool:
     if raw_value is None:
         return default
     return raw_value.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _normalize_signal_to_int(signal_value) -> int:
+    """Converte BUY/SELL/NEUTRAL e valores numéricos para sinal compatível com o monitor."""
+    if signal_value is None:
+        return 0
+    if isinstance(signal_value, bool):
+        return int(signal_value)
+    if isinstance(signal_value, (int, np.integer)):
+        return int(signal_value)
+    if isinstance(signal_value, str):
+        normalized = signal_value.strip().upper()
+        if normalized in {'BUY', 'LONG', 'CALL', 'UP', '1', 'TRUE'}:
+            return 1
+        if normalized in {'SELL', 'SHORT', 'PUT', 'DOWN', '-1', 'FALSE'}:
+            return -1
+        if normalized in {'NEUTRAL', 'NONE', 'FLAT', 'WAIT', '0', ''}:
+            return 0
+        try:
+            return int(float(normalized))
+        except (TypeError, ValueError):
+            return 0
+    try:
+        numeric = float(signal_value)
+    except (TypeError, ValueError):
+        return 0
+    if numeric > 0:
+        return 1
+    if numeric < 0:
+        return -1
+    return 0
+
+
+def _escape_markdown_value(value) -> str:
+    """Escapa conteúdo dinâmico antes de interpolar em mensagens Markdown do Telegram."""
+    return escape_markdown(str(value or ''))
+
+
+def _resolve_initial_bitget_runtime_mode() -> str:
+    """Resolve o modo inicial do executor BitGet a partir do estado persistido/ambiente."""
+    saved_mode = str(_load_bot_state().get('bitget_runtime_mode') or '').strip().lower()
+    if saved_mode in {'off', 'paper', 'demo', 'live'}:
+        return saved_mode
+
+    env_enabled = _env_flag(os.getenv('BITGET_EXECUTOR_ENABLED'), default=False)
+    if not env_enabled:
+        return 'off'
+
+    env_paper = _env_flag(os.getenv('BITGET_PAPER_TRADING'), default=True)
+    if env_paper:
+        return 'paper'
+
+    return 'demo' if os.getenv('BITGET_PRODUCT_TYPE', 'USDT-FUTURES').strip().upper() == 'SUSDT-FUTURES' else 'live'
+
+
+def _apply_bitget_runtime_mode(mode: str) -> str:
+    """Sincroniza o modo BitGet em memória/ambiente para paper, demo, live ou desligado."""
+    global BITGET_EXECUTOR_ENABLED
+
+    normalized = (mode or 'off').strip().lower()
+    if normalized not in {'off', 'paper', 'demo', 'live'}:
+        normalized = 'off'
+
+    BITGET_EXECUTOR_ENABLED = normalized != 'off'
+    os.environ['BITGET_EXECUTOR_ENABLED'] = 'true' if BITGET_EXECUTOR_ENABLED else 'false'
+
+    if normalized == 'paper':
+        os.environ['BITGET_PAPER_TRADING'] = 'true'
+    elif normalized in {'demo', 'live'}:
+        os.environ['BITGET_PAPER_TRADING'] = 'false'
+        os.environ['BITGET_PRODUCT_TYPE'] = 'SUSDT-FUTURES' if normalized == 'demo' else 'USDT-FUTURES'
+
+    return normalized
+
+
+BITGET_RUNTIME_MODE = _apply_bitget_runtime_mode(_resolve_initial_bitget_runtime_mode())
 
 
 # Configuração de logging
@@ -368,6 +457,12 @@ OPERATION_MARKET_MODE = _saved_market_mode or _env_market_mode or _default_opera
 if OPERATION_MARKET_MODE not in {'crypto', 'forex'}:
     OPERATION_MARKET_MODE = _default_operation_market_mode()
 
+_saved_weekend_filter_mode = str(_load_bot_state().get('weekend_filter_mode') or '').strip().lower()
+_env_weekend_filter_mode = str(os.getenv('WEEKEND_FILTER_MODE', '') or '').strip().lower()
+WEEKEND_FILTER_MODE = _saved_weekend_filter_mode or _env_weekend_filter_mode or 'auto'
+if WEEKEND_FILTER_MODE not in {'auto', 'on', 'off'}:
+    WEEKEND_FILTER_MODE = 'auto'
+
 
 def get_operation_market_mode() -> str:
     """Retorna o modo operacional de mercado ativo (crypto|forex)."""
@@ -382,6 +477,38 @@ def set_operation_market_mode(new_mode: str) -> bool:
         return False
     OPERATION_MARKET_MODE = mode
     _save_bot_state('operation_market_mode', mode)
+    return True
+
+
+def get_weekend_filter_mode() -> str:
+    """Retorna a política atual do filtro de fim de semana."""
+    return WEEKEND_FILTER_MODE
+
+
+def set_weekend_filter_mode(new_mode: str) -> bool:
+    """Atualiza e persiste a política do filtro de fim de semana."""
+    global WEEKEND_FILTER_MODE
+    mode = (new_mode or '').strip().lower()
+    if mode not in {'auto', 'on', 'off'}:
+        return False
+    WEEKEND_FILTER_MODE = mode
+    _save_bot_state('weekend_filter_mode', mode)
+    return True
+
+
+def get_bitget_runtime_mode() -> str:
+    """Retorna o modo atual de execução BitGet."""
+    return BITGET_RUNTIME_MODE
+
+
+def set_bitget_runtime_mode(new_mode: str) -> bool:
+    """Atualiza e persiste o modo de execução BitGet."""
+    global BITGET_RUNTIME_MODE
+    mode = (new_mode or '').strip().lower()
+    if mode not in {'off', 'paper', 'demo', 'live'}:
+        return False
+    BITGET_RUNTIME_MODE = _apply_bitget_runtime_mode(mode)
+    _save_bot_state('bitget_runtime_mode', BITGET_RUNTIME_MODE)
     return True
 
 log_market_diagnostic(
@@ -747,6 +874,10 @@ def is_weekend_binary_mode(reference_time: datetime | None = None) -> bool:
     """Ativa operacional de fim de semana apenas para crypto binário."""
     if CURRENT_MARKET_TYPE != 'crypto_binary':
         return False
+    if WEEKEND_FILTER_MODE == 'off':
+        return False
+    if WEEKEND_FILTER_MODE == 'on':
+        return True
     current = reference_time or datetime.utcnow()
     return current.weekday() >= 5
 
@@ -766,6 +897,11 @@ def get_operation_mode_snapshot(reference_time: datetime | None = None) -> dict:
 
     market_mode = get_operation_market_mode()
     market_mode_label = 'Crypto' if market_mode == 'crypto' else 'Forex'
+    weekend_policy_label = {
+        'auto': 'Automático',
+        'on': 'Ligado manualmente',
+        'off': 'Desligado manualmente',
+    }.get(WEEKEND_FILTER_MODE, 'Automático')
 
     if weekend_mode:
         return {
@@ -776,6 +912,8 @@ def get_operation_mode_snapshot(reference_time: datetime | None = None) -> dict:
             'expires': '2 a 3 velas',
             'market_mode': market_mode,
             'market_mode_label': market_mode_label,
+            'weekend_policy': WEEKEND_FILTER_MODE,
+            'weekend_policy_label': weekend_policy_label,
         }
 
     return {
@@ -786,6 +924,8 @@ def get_operation_mode_snapshot(reference_time: datetime | None = None) -> dict:
         'expires': '1 vela',
         'market_mode': market_mode,
         'market_mode_label': market_mode_label,
+        'weekend_policy': WEEKEND_FILTER_MODE,
+        'weekend_policy_label': weekend_policy_label,
     }
 
 
@@ -1015,7 +1155,7 @@ def evaluate_weekend_binary_setup(
     tf_minutes = timeframe_to_minutes(timeframe)
 
     if signal == 0 and signal_data is not None and tf_minutes <= 1:
-        continuation_signal = int(signal_data.get('signal', 0))
+        continuation_signal = _normalize_signal_to_int(signal_data.get('signal', 0))
         continuation_score_hint = float(signal_data.get('score', 0.5))
 
         if continuation_signal == 0:
@@ -1048,7 +1188,7 @@ def evaluate_weekend_binary_setup(
                 warnings.append('scalp weekend: setup de continuidade curta, aceitar no maximo 2 martingales')
 
     if signal == 0 and signal_data is not None and tf_minutes >= 5:
-        continuation_signal = int(signal_data.get('signal', 0))
+        continuation_signal = _normalize_signal_to_int(signal_data.get('signal', 0))
         continuation_score_hint = float(signal_data.get('score', 0.5))
 
         if continuation_signal == 0:
@@ -1259,7 +1399,12 @@ def get_monitor_timeframe_label() -> str:
     """Texto do modo de timeframe ativo no monitor."""
     if monitor_timeframe_mode == 'dynamic':
         active_timeframes = get_active_dynamic_timeframes()
-        suffix = ' (auto fim de semana)' if is_weekend_binary_mode() else ' (auto)'
+        if WEEKEND_FILTER_MODE == 'on':
+            suffix = ' (auto fim de semana manual)'
+        elif WEEKEND_FILTER_MODE == 'off':
+            suffix = ' (auto sem weekend)'
+        else:
+            suffix = ' (auto fim de semana)' if is_weekend_binary_mode() else ' (auto)'
         return ', '.join(active_timeframes) + suffix
     return config.TIMEFRAME
 
@@ -2133,6 +2278,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🔔 **Monitora:**
 /monitor on - Ativar monitoramento automático
 /monitor off - Desativar monitoramento
+/weekend [auto|on|off] - Controlar filtro de fim de semana
 /ativos - Gerenciar ativos monitorados
 /stats - Ver qualidade dos sinais (bom/ruim)
 /externo - Publicar sinal externo (ações/commodities) no chat
@@ -2155,6 +2301,7 @@ Comandos disponíveis:
 ⚙️ **Configuração:**
 /config - Ver configuração atual
 /modo - Ver modo operacional atual
+/bitget_toggle [off|paper|demo|live] - Controlar execução BitGet
 /timeframe [auto|1m|5m|15m|30m|1h|4h|1d] - Mudar timeframe
 /ativo [SYMBOL] - Mudar ativo (ex: /ativo BTC/USDT)
 
@@ -2612,6 +2759,7 @@ async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📊 Ativo: `{config.SYMBOL}`
 ⏱ Timeframe: `{get_monitor_timeframe_label()}`
 🧭 Modo operacional: `{mode_snapshot['label']}`
+🗓 Filtro weekend: `{mode_snapshot['weekend_policy_label']}`
 📝 Leitura atual: {mode_snapshot['summary']}
 🕒 Pool ativo: `{', '.join(mode_snapshot['timeframes'])}`
 ⏳ Expiração base: `{mode_snapshot['expires']}`
@@ -2628,6 +2776,7 @@ async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Para mudar use:
 /timeframe [auto|1m|5m|15m|30m|1h|4h|1d]
+/weekend [auto|on|off]
 /ativo [SYMBOL]
 /modo
     """
@@ -2660,10 +2809,49 @@ async def modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Perfil: {BOT_PROFILE}\n"
         f"• Segmento: {mode_snapshot['market_mode_label']}\n"
         f"• Modo: {mode_snapshot['label']}\n"
+        f"• Filtro weekend: {mode_snapshot['weekend_policy_label']}\n"
         f"• Resumo: {mode_snapshot['summary']}\n"
         f"• Timeframes ativos: {', '.join(mode_snapshot['timeframes'])}\n"
         f"• Expiração base: {mode_snapshot['expires']}\n\n"
-        "Alterar: /modo crypto ou /modo forex"
+        "Alterar: /modo crypto ou /modo forex\n"
+        "Weekend: /weekend auto | /weekend on | /weekend off"
+    )
+    await _reply_text(update, message)
+
+
+async def weekend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /weekend para controlar o filtro de fim de semana."""
+    if context.args:
+        requested_mode = (context.args[0] or '').strip().lower()
+        if requested_mode in {'auto', 'on', 'off'}:
+            set_weekend_filter_mode(requested_mode)
+            labels = {
+                'auto': 'Automático',
+                'on': 'Ligado manualmente',
+                'off': 'Desligado manualmente',
+            }
+            await _reply_text(
+                update,
+                (
+                    f"✅ Filtro weekend ajustado para *{labels[requested_mode]}*.\n"
+                    "Use /monitor para conferir o modo operacional antes do próximo ciclo."
+                ),
+                parse_mode='Markdown',
+            )
+            return
+        await _reply_text(update, "❌ Uso: /weekend [auto|on|off]")
+        return
+
+    snapshot = get_operation_mode_snapshot()
+    message = (
+        "🗓 Controle do Filtro Weekend\n\n"
+        f"• Política atual: {snapshot['weekend_policy_label']}\n"
+        f"• Operacional em uso agora: {snapshot['label']}\n"
+        f"• Timeframes ativos: {', '.join(snapshot['timeframes'])}\n\n"
+        "Alterar:\n"
+        "/weekend auto - segue sábado/domingo automaticamente\n"
+        "/weekend on - força regras de weekend\n"
+        "/weekend off - ignora regras de weekend"
     )
     await _reply_text(update, message)
 
@@ -4111,38 +4299,171 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
 
     # ── Execução Bitget (simulador / real) ───────────────────────────────────
     if BITGET_EXECUTOR_ENABLED:
+        await _execute_bitget_signal(
+            context,
+            chat_id=chat_id,
+            symbol=symbol,
+            direction=direction,
+            price=close,
+            rsi=rsi,
+            ema9=analysis.get('ema9'),
+            quality=quality,
+        )
+
+    # NovaDexy: only after all ATLAS gates; default is disabled/dry-run.
+    if NOVADEXY_EXECUTOR_ENABLED and novadexy_executor is not None:
         try:
-            side = 'buy' if direction == 'BUY' else 'sell'
-            result = await bitget_executor.place_order_async(
-                symbol=symbol,
-                side=side,
-                confidence=score_pct / 100,
-            )
-            if result:
-                exec_msg = f"✅ *Bitget:* ordem enviada (`{side.upper()}` {symbol})"
+            result = await novadexy_executor.place_order_async(symbol=symbol, direction=direction, symbol_price=close)
+            if result.get('ok') and result.get('executed'):
+                tx = (result.get('response') or {}).get('transaction_id', 'sem id')
+                nd_msg = f"✅ *NovaDexy DEMO:* ordem confirmada (`{tx}`)"
+            elif result.get('ok'):
+                nd_msg = "🧪 *NovaDexy DRY-RUN:* payload validado; nenhuma ordem enviada"
             else:
-                exec_msg = f"⚠️ *Bitget:* ordem não confirmada"
+                nd_msg = f"⚠️ *NovaDexy:* falha — `{result.get('error', 'não confirmada')}`"
         except Exception as exc:
-            exec_msg = f"⚠️ *Bitget:* falha — `{exc}`"
+            nd_msg = f"⚠️ *NovaDexy:* falha — `{exc}`"
         try:
-            await context.bot.send_message(
-                chat_id=chat_id, text=exec_msg, parse_mode='Markdown'
-            )
+            await context.bot.send_message(chat_id=chat_id, text=nd_msg, parse_mode='Markdown')
         except Exception:
             pass
 
+
+def _bitget_mode_label() -> str:
+    """Texto amigável do modo de execução BitGet."""
+    labels = {
+        'off': 'Desligado',
+        'paper': 'Paper local',
+        'demo': 'Demo BitGet',
+        'live': 'Live BitGet',
+    }
+    return labels.get(BITGET_RUNTIME_MODE, 'Desligado')
+
+
+def _sync_bitget_runtime_module(_bx) -> None:
+    """Sincroniza o módulo do executor BitGet com o modo ativo do bot."""
+    _bx.PAPER_TRADING = BITGET_RUNTIME_MODE == 'paper'
+    _bx.PRODUCT_TYPE = 'SUSDT-FUTURES' if BITGET_RUNTIME_MODE == 'demo' else 'USDT-FUTURES'
+    _bx.BALANCE_COIN = 'SUSDT' if _bx.PRODUCT_TYPE == 'SUSDT-FUTURES' else 'USDT'
+    _bx.MARGIN_COIN = 'SUSDT' if _bx.PRODUCT_TYPE == 'SUSDT-FUTURES' else 'USDT'
+
+
+def _bitget_quality_label_from_probability(probability: float) -> str:
+    """Classifica a qualidade operacional enviada ao executor BitGet."""
+    if probability >= 65:
+        return 'FORTE 🎯'
+    if probability >= 55:
+        return 'MODERADO'
+    return 'FRACO ⚠️'
+
+
+def _resolve_bitget_trade_target(symbol: str) -> tuple[str | None, str | None]:
+    """Mapeia o símbolo monitorado para o contrato USDT da BitGet."""
+    raw_symbol = str(symbol or '').strip().upper()
+    if not raw_symbol:
+        return None, None
+
+    base_symbol = raw_symbol.split('/')[0]
+    bitget_symbol = BITGET_FUTURES_MAP.get(base_symbol)
+    if bitget_symbol:
+        return base_symbol, bitget_symbol
+
+    if raw_symbol.endswith('/USDT'):
+        return base_symbol, f"{base_symbol}USDT"
+
+    return None, None
+
+
+async def _execute_bitget_signal(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id,
+    symbol: str,
+    direction: str,
+    price: float,
+    rsi: float = 50.0,
+    ema9: float | None = None,
+    quality: str = 'MODERADO',
+):
+    """Executa um sinal aprovado no modo BitGet ativo e notifica o resultado no chat."""
+    if not BITGET_EXECUTOR_ENABLED:
+        return None
+
+    from src.core import bitget_executor as _bx
+
+    _sync_bitget_runtime_module(_bx)
+    asset, bitget_symbol = _resolve_bitget_trade_target(symbol)
+    if not asset or not bitget_symbol:
+        logger.warning("[BITGET] Símbolo não suportado para execução: %s", symbol)
+        if chat_id:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ *BitGet:* ativo `{_escape_markdown_value(symbol)}` sem mapeamento para execução",
+                parse_mode='Markdown',
+            )
+        return None
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
+        _bx.execute_trade,
+        asset,
+        bitget_symbol,
+        direction,
+        float(price),
+        float(rsi),
+        quality,
+        float(ema9) if ema9 is not None else None,
+    )
+
+    mode_label = result.get('mode') or _bitget_mode_label().upper()
+    if result.get('ok'):
+        if result.get('trade'):
+            exec_msg = (
+                f"✅ *BitGet {mode_label}:* ordem simulada\n"
+                f"• Ativo: `{_escape_markdown_value(symbol)}`\n"
+                f"• Direção: `{direction}`\n"
+                f"• Preço: `{float(price):.4f}`"
+            )
+        else:
+            order_id = ((result.get('order') or {}).get('id') or 'sem id')
+            exec_msg = (
+                f"✅ *BitGet {mode_label}:* ordem enviada\n"
+                f"• Ativo: `{_escape_markdown_value(symbol)}`\n"
+                f"• Direção: `{direction}`\n"
+                f"• Ordem: `{_escape_markdown_value(order_id)}`"
+            )
+    else:
+        exec_msg = (
+            f"⚠️ *BitGet {mode_label}:* falha na execução\n"
+            f"• Ativo: `{_escape_markdown_value(symbol)}`\n"
+            f"• Motivo: `{_escape_markdown_value(result.get('error', 'não confirmado'))}`"
+        )
+
+    logger.info("[BITGET] %s | symbol=%s direction=%s ok=%s", mode_label, symbol, direction, result.get('ok'))
+    if chat_id:
+        await context.bot.send_message(chat_id=chat_id, text=exec_msg, parse_mode='Markdown')
+    return result
 
 
 async def bitget_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mostra resumo das operações paper/live da BitGet."""
     from src.core import bitget_executor as _bx
+    _sync_bitget_runtime_module(_bx)
     s = _bx.get_paper_summary()
-    mode_str = '📋 PAPER (simulado)' if s['mode'] == 'PAPER' else '🔴 LIVE (dinheiro real)'
-    balance_str = f"${s['balance']:.2f}" if s['mode'] == 'PAPER' else '(saldo real via API)'
-    pnl_str = f"${s['total_pnl']:+.2f}" if s['mode'] == 'PAPER' else '—'
+    runtime_mode = get_bitget_runtime_mode()
+    mode_str = {
+        'off': '⏹ DESLIGADO',
+        'paper': '📋 PAPER (simulado)',
+        'demo': '🧪 DEMO BITGET (simulador da corretora)',
+        'live': '🔴 LIVE (dinheiro real)',
+    }.get(runtime_mode, '⏹ DESLIGADO')
+    balance_str = f"${s['balance']:.2f}" if runtime_mode == 'paper' else '(saldo via API da BitGet)'
+    pnl_str = f"${s['total_pnl']:+.2f}" if runtime_mode == 'paper' else '—'
 
     lines = [
         f"📊 *BitGet Futures — {mode_str}*\n",
+        f"Execução automática: `{'ON' if BITGET_EXECUTOR_ENABLED else 'OFF'}`",
         f"Saldo paper: `{balance_str}`",
         f"Posições abertas: `{s['open']}`",
         f"Fechadas: `{s['closed']}` | P&L total: `{pnl_str}`",
@@ -4158,35 +4479,51 @@ async def bitget_status_command(update: Update, context: ContextTypes.DEFAULT_TY
             )
     if not _bx.is_configured():
         lines.append('\n⚠️ _Passphrase não configurada — somente paper disponível_')
-        lines.append('Configure BITGET\\_PASSPHRASE no .env para live trading')
+        lines.append('Configure BITGET\\_PASSPHRASE no .env para demo/live na BitGet')
 
     await _reply_text(update, '\n'.join(lines))
 
 
 async def bitget_toggle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Liga/desliga o modo live da BitGet. Uso: /bitget_toggle live | paper"""
+    """Controla execução BitGet. Uso: /bitget_toggle off|paper|demo|live"""
     from src.core import bitget_executor as _bx
+    global BITGET_RUNTIME_MODE
     arg = (context.args[0].lower() if context.args else '').strip()
-    if arg == 'live':
+    if arg == 'off':
+        set_bitget_runtime_mode('off')
+        await _reply_text(update, '⏹ *Execução BitGet desligada.* O bot seguirá apenas alertando no Telegram.')
+    elif arg == 'paper':
+        set_bitget_runtime_mode('paper')
+        _sync_bitget_runtime_module(_bx)
+        await _reply_text(update, '📋 *Modo PAPER ativado.* Alertas aprovados abrirão trades simulados locais.')
+    elif arg == 'demo':
+        if not _bx.is_configured():
+            await _reply_text(update,
+                '❌ Não é possível ativar demo: BITGET\\_PASSPHRASE não configurada no .env')
+            return
+        set_bitget_runtime_mode('demo')
+        _sync_bitget_runtime_module(_bx)
+        await _reply_text(update,
+            '🧪 *Modo DEMO BitGet ativado!*\n'
+            'Próximos sinais aprovados serão enviados para a conta simulada da BitGet.\n'
+            'Para desligar: /bitget\\_toggle off')
+    elif arg == 'live':
         if not _bx.is_configured():
             await _reply_text(update,
                 '❌ Não é possível ativar live: BITGET\\_PASSPHRASE não configurada no .env')
             return
-        os.environ['BITGET_PAPER_TRADING'] = 'false'
-        _bx.PAPER_TRADING = False
+        set_bitget_runtime_mode('live')
+        _sync_bitget_runtime_module(_bx)
         await _reply_text(update,
             '🔴 *Modo LIVE ativado!*\n'
             'Próximas ordens serão executadas com dinheiro real.\n'
-            'Para voltar ao paper: /bitget\\_toggle paper')
-    elif arg == 'paper':
-        os.environ['BITGET_PAPER_TRADING'] = 'true'
-        _bx.PAPER_TRADING = True
-        await _reply_text(update, '📋 *Modo PAPER ativado.* Ordens são apenas simuladas.')
+            'Para voltar ao demo: /bitget\\_toggle demo\n'
+            'Para desligar: /bitget\\_toggle off')
     else:
-        mode = 'PAPER 📋' if _bx.PAPER_TRADING else 'LIVE 🔴'
         await _reply_text(update,
-            f'BitGet modo atual: *{mode}*\n'
-            'Uso: `/bitget_toggle paper` ou `/bitget_toggle live`')
+            f'BitGet modo atual: *{_bitget_mode_label()}*\n'
+            f'Execução automática: *{"ON" if BITGET_EXECUTOR_ENABLED else "OFF"}*\n'
+            'Uso: `/bitget_toggle off`, `/bitget_toggle paper`, `/bitget_toggle demo` ou `/bitget_toggle live`')
 
 
 async def bitget_config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4408,23 +4745,16 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                         current_price = float(df_live.iloc[-1]['close'])
 
                     entry_price = float(pending.get('entry_price') or current_price)
-                    # Safe conversion: handle 'NEUTRAL' string and other edge cases
+                    # Safe conversion: handle strings como BUY/SELL/NEUTRAL e valores numéricos.
                     pending_signal_val = pending['signal']
-                    if isinstance(pending_signal_val, str) and pending_signal_val == 'NEUTRAL':
-                        pending_signal = 0
-                    else:
-                        pending_signal = int(pending_signal_val) if pending_signal_val else 0
+                    pending_signal = _normalize_signal_to_int(pending_signal_val)
                     is_losing_now = (
                         current_price < entry_price if pending_signal == 1 else current_price > entry_price
                     )
 
                     if is_losing_now:
-                        # Safe conversion: handle 'NEUTRAL' string and other edge cases
                         weekend_signal_val = weekend_setup['signal']
-                        if isinstance(weekend_signal_val, str) and weekend_signal_val == 'NEUTRAL':
-                            signal = 0
-                        else:
-                            signal = int(weekend_signal_val) if weekend_signal_val else 0
+                        signal = _normalize_signal_to_int(weekend_signal_val)
                         setup_score = int(weekend_setup['score'])
                         probability = float(weekend_setup['probability'])
                         score = max(float(signal_data.get('score', 0.5)), float(setup_score) / 10.0)
@@ -4722,33 +5052,35 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                 signal_data = analyzer.get_current_signal()
                 weekend_mode = is_weekend_binary_mode(now)
                 weekend_setup = evaluate_weekend_binary_setup(closed_df, timeframe, signal_data) if weekend_mode else None
+                analyzer_signal = _normalize_signal_to_int(signal_data.get('signal'))
 
                 if ticker is None:
                     ticker = exchange.get_ticker(market_symbol)
                 current_price = ticker['last'] if ticker else closed_df.iloc[-1]['close']
 
                 if weekend_setup is not None:
-                    # Safe conversion: handle 'NEUTRAL' string and other edge cases
                     weekend_signal_val = weekend_setup['signal']
-                    if isinstance(weekend_signal_val, str) and weekend_signal_val == 'NEUTRAL':
-                        signal = 0
+                    weekend_signal = _normalize_signal_to_int(weekend_signal_val)
+                    if weekend_signal == 0 and analyzer_signal != 0:
+                        logger.info(
+                            "[WEEKEND-FALLBACK] %s %s: weekend neutro, usando analyzer=%s",
+                            symbol,
+                            timeframe,
+                            signal_data.get('signal'),
+                        )
+                        weekend_mode = False
+                        weekend_setup = None
+                        signal = analyzer_signal
+                        score = signal_data['score']
                     else:
-                        signal = int(weekend_signal_val) if weekend_signal_val else 0
-                    score = max(
-                        float(signal_data.get('score', 0.5)),
-                        float(weekend_setup['score']) / 10.0,
-                    )
-                    signal_data['probability'] = float(weekend_setup['probability'])
+                        signal = weekend_signal
+                        score = max(
+                            float(signal_data.get('score', 0.5)),
+                            float(weekend_setup['score']) / 10.0,
+                        )
+                        signal_data['probability'] = float(weekend_setup['probability'])
                 else:
-                    # ⚠️ IMPORTANTE: analyzer.get_current_signal() retorna signal como STRING ("BUY"/"SELL"/"NEUTRAL")
-                    # Converter para número (1/-1/0) para compatibilidade com lógica abaixo
-                    signal_str = signal_data['signal']
-                    if signal_str == 'BUY':
-                        signal = 1
-                    elif signal_str == 'SELL':
-                        signal = -1
-                    else:
-                        signal = 0
+                    signal = analyzer_signal
                     score = signal_data['score']
                 symbol_key = get_monitor_signal_scope_key(symbol, timeframe)
                 monitor_analysis_count['analyzed'] += 1
@@ -5046,7 +5378,7 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                                 tech_confirm = TechnicalIndicators(closed_confirm)
                                 closed_confirm = tech_confirm.calculate_all_indicators(MONITOR_INDICATORS_CONFIG)
                                 analyzer_confirm = TradingAnalyzer(closed_confirm)
-                                confirm_signal = int(analyzer_confirm.get_current_signal()['signal'])
+                                confirm_signal = _normalize_signal_to_int(analyzer_confirm.get_current_signal().get('signal'))
                                 confirm_primary_trend = get_primary_trend(exchange, market_symbol, '5m')
                                 m5_confirmation_context = (confirm_signal, confirm_primary_trend)
                             else:
@@ -5154,6 +5486,18 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                 if timeframe == '1m' and confirm_signal == signal:
                     entry_profile_line += " | confirmação M5 ✅"
 
+                escaped_symbol = _escape_markdown_value(symbol)
+                escaped_setup_type = _escape_markdown_value(setup['setup_type'])
+                escaped_atlas_recommendation = _escape_markdown_value(atlas_recommendation)
+                escaped_timeframe = _escape_markdown_value(timeframe)
+                escaped_entry_profile_line = _escape_markdown_value(entry_profile_line)
+                escaped_confirmations = [
+                    _escape_markdown_value(item) for item in setup['confirmations']
+                ]
+                escaped_warnings = [
+                    _escape_markdown_value(item) for item in setup['warnings']
+                ]
+
                 protection_line = ""
                 if entry_decision['profile'] == 'aceita 1 protecao':
                     first_protection = next_candle + timedelta(minutes=timeframe_to_minutes(timeframe))
@@ -5179,49 +5523,49 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     message = f"""
 ⚠️ **ALERTA SIMPLES DE MARTINGALE**
 
-{emoji} **{action} - {symbol}**
+{emoji} **{action} - {escaped_symbol}**
 
 ⏰ **Entrar até 10s da abertura do próximo candle ({next_candle.strftime('%H:%M')})**
 💸 Sugestão: avaliar dobrar valor somente se o contexto ainda estiver limpo
 🔁 Tentativa: {martingale_step} de {WEEKEND_MAX_REENTRIES}
-🧠 Setup: {setup['setup_type']}
+🧠 Setup: {escaped_setup_type}
 🏗 Score estrutural: {setup['score']}
 📈 Probabilidade: {probability:.1f}%
 
 🔎 Confirmações:
-• """ + "\n• ".join(setup['confirmations']) + f"""
+• """ + "\n• ".join(escaped_confirmations) + f"""
 
-⏱ Timeframe: {timeframe}
+⏱ Timeframe: {escaped_timeframe}
 🕐 {datetime.now().strftime('%H:%M:%S')}
                     """
                 else:
                     message = f"""
 🚨 **ALERTA DE SINAL!**
 
-{emoji} **{action} - {symbol}**
+{emoji} **{action} - {escaped_symbol}**
 
 ⏰ **PRE-ALERTA (janela {int(effective_pre_alert_max)}s-{int(effective_pre_alert_min)}s): ENTRAR NA ABERTURA DO PRÓXIMO CANDLE ({next_candle.strftime('%H:%M')})**
 💵 Preço Referência: ${current_price:,.2f}{primary_trend_line}
-{entry_profile_line}
-🧠 Setup: {setup['setup_type']}
+{escaped_entry_profile_line}
+🧠 Setup: {escaped_setup_type}
 🏗 Score estrutural: {setup['score']}/{max(8, min_setup_score + 1)}
 📊 Score base: {score:.3f}
 📊 Score ATLAS: {atlas_score:.3f} ({atlas_score_pct}%)
 📈 Probabilidade: {probability:.1f}%
 ✅ Consenso de indicadores: {consensus}/4
-🧪 Classificação ATLAS: {atlas_recommendation}
+🧪 Classificação ATLAS: {escaped_atlas_recommendation}
 ✅ Confluência ATLAS: {atlas_confluence}/5 técnicas
 
 🔎 Confirmações:
-• """ + "\n• ".join(setup['confirmations']) + f"""
+• """ + "\n• ".join(escaped_confirmations) + f"""
 
-⏱ Timeframe: {timeframe}
+⏱ Timeframe: {escaped_timeframe}
 ⏳ Expiração binária: {expiry_candles} candle{'s' if expiry_candles > 1 else ''} (~{expiry_minutes} min)
 🕐 {datetime.now().strftime('%H:%M:%S')}
                     """
 
-                if setup['warnings']:
-                    message += "\n⚠️ Pontos de atenção:\n• " + "\n• ".join(setup['warnings'])
+                if escaped_warnings:
+                    message += "\n⚠️ Pontos de atenção:\n• " + "\n• ".join(escaped_warnings)
                 message += protection_line
 
                 candidate_alert = {
@@ -5230,6 +5574,9 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     'market_symbol': market_symbol,
                     'signal': signal,
                     'entry_price': current_price,
+                    'rsi': float(closed_df.iloc[-1].get('rsi', 50.0)),
+                    'ema9': float(closed_df.iloc[-1].get('ema9', current_price)),
+                    'quality': _bitget_quality_label_from_probability(probability),
                     'evaluate_at': next_candle + timedelta(minutes=expiry_minutes),
                     'candle_open_time': next_candle,
                     'pre_alert_key': pre_alert_key,
@@ -5276,6 +5623,8 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
             monitor_last_alert_at = now
             monitor_last_heartbeat_at = now
 
+        # Atualiza estado de dedup IMEDIATAMENTE após envio para garantir que
+        # qualquer erro downstream (ex: BitGet) não cause sinais duplicados.
         monitor_signals_sent += 1
         
         # Registra envio para anti-spam
@@ -5312,6 +5661,22 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             reset_weekend_reentry_state(alert_to_send['symbol_key'])
+
+        # Execução BitGet isolada — erro não afeta o estado de dedup já salvo acima.
+        if chat_id and BITGET_EXECUTOR_ENABLED:
+            try:
+                await _execute_bitget_signal(
+                    context,
+                    chat_id=chat_id,
+                    symbol=alert_to_send['symbol'],
+                    direction='BUY' if alert_to_send['signal'] == 1 else 'SELL',
+                    price=alert_to_send['entry_price'],
+                    rsi=alert_to_send.get('rsi', 50.0),
+                    ema9=alert_to_send.get('ema9'),
+                    quality=alert_to_send.get('quality', 'MODERADO'),
+                )
+            except Exception as _bitget_err:
+                logger.error("[BITGET] Erro na execução do sinal: %s", _bitget_err)
 
         entry_log = "n/a" if alert_to_send['entry_price'] is None else f"{alert_to_send['entry_price']:.4f}"
         logger.info(
@@ -5409,6 +5774,8 @@ def main():
     application.add_handler(CommandHandler("ativos", ativos_command))
     application.add_handler(CommandHandler("config", config_command))
     application.add_handler(CommandHandler("modo", modo_command))
+    application.add_handler(CommandHandler("weekend", weekend_command))
+    application.add_handler(CommandHandler("fimdesemana", weekend_command))
     application.add_handler(CommandHandler("timeframe", timeframe_command))
     application.add_handler(CommandHandler("tf", timeframe_command))
     application.add_handler(CommandHandler("timefrafe", timeframe_command))

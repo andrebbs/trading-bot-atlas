@@ -4403,7 +4403,9 @@ async def _execute_bitget_signal(
             )
         return None
 
-    result = await asyncio.to_thread(
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
         _bx.execute_trade,
         asset,
         bitget_symbol,
@@ -5620,18 +5622,9 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
             )
             monitor_last_alert_at = now
             monitor_last_heartbeat_at = now
-            if BITGET_EXECUTOR_ENABLED:
-                await _execute_bitget_signal(
-                    context,
-                    chat_id=chat_id,
-                    symbol=alert_to_send['symbol'],
-                    direction='BUY' if alert_to_send['signal'] == 1 else 'SELL',
-                    price=alert_to_send['entry_price'],
-                    rsi=alert_to_send.get('rsi', 50.0),
-                    ema9=alert_to_send.get('ema9'),
-                    quality=alert_to_send.get('quality', 'MODERADO'),
-                )
 
+        # Atualiza estado de dedup IMEDIATAMENTE após envio para garantir que
+        # qualquer erro downstream (ex: BitGet) não cause sinais duplicados.
         monitor_signals_sent += 1
         
         # Registra envio para anti-spam
@@ -5668,6 +5661,22 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             reset_weekend_reentry_state(alert_to_send['symbol_key'])
+
+        # Execução BitGet isolada — erro não afeta o estado de dedup já salvo acima.
+        if chat_id and BITGET_EXECUTOR_ENABLED:
+            try:
+                await _execute_bitget_signal(
+                    context,
+                    chat_id=chat_id,
+                    symbol=alert_to_send['symbol'],
+                    direction='BUY' if alert_to_send['signal'] == 1 else 'SELL',
+                    price=alert_to_send['entry_price'],
+                    rsi=alert_to_send.get('rsi', 50.0),
+                    ema9=alert_to_send.get('ema9'),
+                    quality=alert_to_send.get('quality', 'MODERADO'),
+                )
+            except Exception as _bitget_err:
+                logger.error("[BITGET] Erro na execução do sinal: %s", _bitget_err)
 
         entry_log = "n/a" if alert_to_send['entry_price'] is None else f"{alert_to_send['entry_price']:.4f}"
         logger.info(

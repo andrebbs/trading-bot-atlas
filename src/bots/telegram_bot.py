@@ -14,6 +14,7 @@ import asyncio
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Tuple
 import atexit
 import fcntl
@@ -32,6 +33,18 @@ from src.core.market_router import normalize_market_type
 from src.core import economic_calendar
 from src.core.smc_detector import SMCDetector
 from src.core.confluence_score import ConfluenceScoreSystem
+from src.core.lot_defense import (
+    BreakSituation,
+    Candle as LotCandle,
+    DefenseSituation,
+    LotReading,
+    LotSide,
+    build_lot_framework,
+    detect_lots,
+    evaluate_lot_sequence,
+    is_counter_trade_allowed,
+    is_same_side_entry_allowed,
+)
 from src.utils.pocket_signal_parser import PocketSignalParser, TradingSignal
 from config import config
 
@@ -56,6 +69,32 @@ if NOVADEXY_EXECUTOR_ENABLED:
     except Exception as _err:
         logger.warning('NovaDexy executor indisponível: %s', _err)
         NOVADEXY_EXECUTOR_ENABLED = False
+
+# Stockity/Binomo (Crypto IDX) stays off unless explicitly enabled; LIVE mode
+# additionally requires STOCKITY_CONFIRM_LIVE=true (dinheiro real).
+STOCKITY_EXECUTOR_ENABLED = os.getenv('STOCKITY_EXECUTOR_ENABLED', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
+stockity_executor = None
+if STOCKITY_EXECUTOR_ENABLED:
+    try:
+        from src.core.stockity_executor import get_executor as _get_stockity_executor
+        stockity_executor = _get_stockity_executor()
+    except Exception as _err:
+        logger.warning('Stockity executor indisponível: %s', _err)
+        STOCKITY_EXECUTOR_ENABLED = False
+
+# ATLAS Crypto IDX — Rejeição: dedicated support/resistance rejection engine,
+# separate from the multi-technique ATLAS confluence scanner. Off by default;
+# only auto-executes on Stockity when quality == 'A' and action == 'ENTRAR'.
+_ATLAS_CRYPTOIDX_SCAN_INTERVAL = int(os.getenv('ATLAS_CRYPTOIDX_SCAN_INTERVAL_SECONDS', '60'))
+_atlas_cryptoidx_scan_active = False
+_atlas_cryptoidx_last_signal_key = None
+# Qualidade mínima (A/B/C) exigida para o auto-scan enviar alerta e, no caso
+# de A, executar automaticamente na Stockity. Configurável em runtime via
+# /atlas_cryptoidx_quality; padrão vem de ATLAS_CRYPTOIDX_MIN_QUALITY no .env.
+_ATLAS_CRYPTOIDX_QUALITY_ORDER = {"A": 3, "B": 2, "C": 1}
+_atlas_cryptoidx_min_quality = os.getenv('ATLAS_CRYPTOIDX_MIN_QUALITY', 'B').strip().upper()
+if _atlas_cryptoidx_min_quality not in _ATLAS_CRYPTOIDX_QUALITY_ORDER:
+    _atlas_cryptoidx_min_quality = 'B'
 
 def _now_str() -> str:
     from datetime import datetime
@@ -2267,6 +2306,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     main_section = """
 📊 **Análise:**
 /analise - Análise completa do ativo atual
+/lote - Leitura educacional de defesas/rompimento em lotes de velas (ex: /lote BTC/USDT 5m)
 /btc - Análise do Bitcoin (BTC/USDT)
 /eth - Análise do Ethereum (ETH/USDT)
 /sol - Análise do Solana (SOL/USDT)
@@ -2282,6 +2322,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /ativos - Gerenciar ativos monitorados
 /stats - Ver qualidade dos sinais (bom/ruim)
 /externo - Publicar sinal externo (ações/commodities) no chat
+
+🟠 **ATLAS Crypto IDX (Stockity, Rejeição S/R):**
+/atlas_cryptoidx - Analisar Crypto IDX agora (sob demanda)
+/atlas_cryptoidx_auto [on|off] - Ligar/desligar scanner automático (a cada 60s)
+/atlas_cryptoidx_quality [A|B|C] - Qualidade mínima que gera alerta (padrão B)
     """.strip()
 
     profile_section = main_section
@@ -2698,6 +2743,218 @@ async def _analyze_quick_symbol(
             return
 
     await analyze(update, context, symbol=symbol, timeframe=timeframe)
+
+
+_LOT_READING_LABELS = {
+    LotReading.TEST_PENDING_CONFIRMATION: "🟡 Pavio sem fechamento confirmado: teste; aguardando confirmação.",
+    LotReading.POSSIBLE_DEFENSE: "🟢 Fechamento na defesa: possível defesa; observar reação seguinte.",
+    LotReading.LOSS_ALERT: "🟠 Fechamento além da defesa: alerta de perda do lote.",
+    LotReading.INVALIDATED: "🔴 Rompimento com continuidade e sem recuperação: lote invalidado.",
+}
+
+_LOT_DEFENSE_SITUATION_LABELS = {
+    DefenseSituation.STRONG_REJECTION: "Situação 1 — defesa mais forte (teste rejeitado com folga).",
+    DefenseSituation.LOCKED_AT_OPEN: "Situação 2 — vela travada no nível de comando (defesa forte).",
+    DefenseSituation.WICK_WITHOUT_LOCK: "Situação 3 — pavio sem travamento (defesa mais fraca, exige confirmação).",
+}
+
+_LOT_BREAK_SITUATION_LABELS = {
+    BreakSituation.CLOSE_BELOW_COMMAND_LEVEL: "Rompimento 1 — fechamento além da abertura da vela de comando.",
+    BreakSituation.CLOSE_BELOW_FIRST_REGISTER: "Rompimento 2 — fechamento além do primeiro registro/pavio relevante.",
+    BreakSituation.CONFIRMED_CONTINUATION: "Rompimento 3 — continuidade confirmada, sem recuperação.",
+}
+
+
+def _format_lot_price(value) -> str:
+    """Formata preço em string curta, sem notação científica."""
+
+    text = f"{float(value):.8f}".rstrip('0')
+    if text.endswith('.'):
+        text += '0'
+    return text
+
+
+def _dataframe_to_lot_candles(df) -> list[LotCandle]:
+    """Converte um DataFrame OHLCV (index = timestamp) em candles fechados."""
+
+    candles: list[LotCandle] = []
+    for ts, row in df.iterrows():
+        candles.append(
+            LotCandle(
+                timestamp=ts.to_pydatetime() if hasattr(ts, 'to_pydatetime') else ts,
+                open=Decimal(str(row['open'])),
+                high=Decimal(str(row['high'])),
+                low=Decimal(str(row['low'])),
+                close=Decimal(str(row['close'])),
+            )
+        )
+    return candles
+
+
+async def lote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /lote (alias /defesa): leitura educacional de defesas e
+    rompimentos em lotes de velas (vela de comando, primeiro registro,
+    travamento e rompimento de vela).
+
+    Uso: /lote [SYMBOL] [timeframe]  (ex: /lote BTC/USDT 5m)
+    Sem argumentos, usa o ativo/timeframe configurados no bot.
+
+    Aviso: leitura puramente educacional/descritiva, sem promessa de
+    resultado. Não substitui gestão de risco, validação em conta demo/
+    backtest e confirmação do contexto de mercado.
+    """
+    symbol = None
+    timeframe = None
+
+    if context.args:
+        raw_symbol = (context.args[0] or '').strip().upper().replace('-', '/').replace(' ', '')
+        alias_map = {
+            'BTC': 'BTC/USDT',
+            'ETH': 'ETH/USDT',
+            'SOL': 'SOL/USDT',
+            'BNB': 'BNB/USDT',
+            'ADA': 'ADA/USDT',
+            'XRP': 'XRP/USDT',
+            'LTC': 'LTC/USDT',
+        }
+        symbol = alias_map.get(raw_symbol, raw_symbol if '/' in raw_symbol else f'{raw_symbol}/USDT')
+
+        if len(context.args) > 1:
+            candidate_tf = (context.args[1] or '').strip().lower()
+            if candidate_tf not in SUPPORTED_TIMEFRAMES:
+                await update.message.reply_text(
+                    f"❌ Timeframe inválido: {candidate_tf}. Use: {', '.join(SUPPORTED_TIMEFRAMES)}"
+                )
+                return
+            timeframe = candidate_tf
+
+    current_symbol = (symbol or config.SYMBOL).upper()
+    current_timeframe = _resolve_analysis_timeframe(timeframe)
+
+    if current_symbol in EXTERNAL_FOREX:
+        await update.message.reply_text(
+            f"⚠️ `{current_symbol}` é Forex. A leitura de lotes de velas via `/lote` "
+            "só está disponível para pares com dados de exchange (crypto).",
+            parse_mode='Markdown',
+        )
+        return
+
+    await update.message.reply_text(
+        f"📐 Lendo lotes de velas em `{current_symbol}` ({current_timeframe})... ⏳",
+        parse_mode='Markdown',
+    )
+
+    try:
+        exchange = ExchangeConnector(testnet=config.TESTNET)
+        df = exchange.fetch_ohlcv(current_symbol, current_timeframe, limit=200)
+        if df is None or len(df) < 10:
+            await update.message.reply_text(
+                f"❌ Sem dados suficientes para `{current_symbol}` no timeframe {current_timeframe}.",
+                parse_mode='Markdown',
+            )
+            return
+
+        candles = _dataframe_to_lot_candles(df)
+        lots = detect_lots(candles)
+        if not lots:
+            await update.message.reply_text(
+                f"ℹ️ Nenhum lote formado nos últimos {len(candles)} candles de `{current_symbol}` "
+                f"({current_timeframe}) — todas as velas seguiram a mesma direção.",
+                parse_mode='Markdown',
+            )
+            return
+
+        # `detect_lots` cria um novo lote a cada troca de cor de vela. Por isso,
+        # o último lote da lista nunca tem candles de reação para avaliar (se
+        # tivesse, essa reação já teria virado outro lote). O lote realmente
+        # "testável" é o penúltimo: seus candles seguintes incluem a vela que
+        # rompeu/testou sua defesa e, se aplicável, deu origem ao lote seguinte.
+        if len(lots) >= 2:
+            last_lot = lots[-2]
+            newer_lot = lots[-1]
+        else:
+            last_lot = lots[-1]
+            newer_lot = None
+
+        following = candles[last_lot.reference_index + 1:]
+        evaluations = evaluate_lot_sequence(last_lot, following)
+        framework = build_lot_framework(last_lot, following, evaluations)
+
+        side_label = "COMPRA" if last_lot.side is LotSide.BUY else "VENDA"
+        side_emoji = "🟢" if last_lot.side is LotSide.BUY else "🔴"
+
+        lines = [
+            f"{side_emoji} **Lote de {side_label}** — `{current_symbol}` ({current_timeframe})",
+            "",
+            f"🕯️ Vela de comando: `{last_lot.reference_candle.timestamp:%Y-%m-%d %H:%M}`",
+            f"• Abertura (nível de comando): `{_format_lot_price(last_lot.command_level)}`",
+            f"• Fechamento (confirmação): `{_format_lot_price(last_lot.confirmation_level)}`",
+        ]
+        if last_lot.first_register is not None:
+            lines.append(f"• Primeiro registro/pavio relevante: `{_format_lot_price(last_lot.first_register)}`")
+
+        if not evaluations:
+            lines.append("")
+            lines.append("ℹ️ Ainda não há candles seguintes para avaliar defesa/rompimento.")
+        else:
+            last_eval = evaluations[-1]
+            lines.append("")
+            lines.append(f"📊 **Leitura atual** ({len(evaluations)} candle(s) após a vela de comando):")
+            lines.append(_LOT_READING_LABELS[last_eval.reading])
+            if last_eval.defense_situation is not None:
+                lines.append(_LOT_DEFENSE_SITUATION_LABELS[last_eval.defense_situation])
+            if last_eval.break_situation is not None:
+                lines.append(_LOT_BREAK_SITUATION_LABELS[last_eval.break_situation])
+
+        lines.append("")
+        lines.append(
+            f"🛡️ **Defesas observadas:** `{framework.defense_count}/"
+            f"{framework.minimum_defenses}`"
+        )
+        if framework.observed_defenses:
+            lines.append("• " + ", ".join(framework.observed_defenses))
+        if framework.blocked_filters:
+            lines.append("⛔ Filtros ativos: " + ", ".join(framework.blocked_filters))
+        elif framework.eligible_for_review:
+            lines.append("✅ Estrutura mínima atingida para revisão manual; não é ordem automática.")
+        else:
+            lines.append("⏳ Aguardar pelo menos 3 defesas observáveis antes de revisar entrada.")
+
+        counter_side_label = "Venda" if last_lot.side is LotSide.BUY else "Compra"
+        counter_allowed = is_counter_trade_allowed(last_lot)
+        same_side_allowed = is_same_side_entry_allowed(last_lot)
+
+        lines.append("")
+        lines.append(f"🔒 Status do lote: `{last_lot.status.value}`")
+        lines.append(
+            f"• {counter_side_label} contra o lote: "
+            + ("liberada (rompimento confirmado — seção 5.5)" if counter_allowed else "bloqueada (defesa ainda válida)")
+        )
+        lines.append(
+            "• Nova entrada a favor do lote original: "
+            + ("bloqueada (defesa invalidada)" if not same_side_allowed else "permitida com confirmação")
+        )
+        if newer_lot is not None and last_lot.status.value == 'INVALIDATED':
+            newer_side_label = "COMPRA" if newer_lot.side is LotSide.BUY else "VENDA"
+            lines.append(
+                f"• Um novo lote de {newer_side_label} já começou em "
+                f"`{newer_lot.reference_candle.timestamp:%Y-%m-%d %H:%M}` — acompanhe sua própria defesa separadamente."
+            )
+        lines.append("")
+        lines.append(
+            "⚠️ Leitura educacional/descritiva, sem garantia de resultado. "
+            "Confirme contexto de mercado, use gestão de risco e valide em "
+            "conta demo/backtest antes de operar."
+        )
+
+        await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+    except Exception as exc:
+        logger.error("Erro no comando /lote: %s", exc, exc_info=True)
+        await update.message.reply_text(
+            f"❌ Erro ao ler lotes de `{current_symbol}`: {exc}",
+            parse_mode='Markdown',
+        )
 
 
 async def btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4328,6 +4585,21 @@ async def auto_scan_externos(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    # Stockity (Crypto IDX): only after all ATLAS gates; off by default.
+    if STOCKITY_EXECUTOR_ENABLED and stockity_executor is not None:
+        try:
+            st_result = await stockity_executor.place_order_async(symbol=symbol, direction=direction)
+            if st_result.get('ok') and st_result.get('executed'):
+                st_msg = f"✅ *Stockity {st_result.get('mode')}:* ordem enviada (`ref {st_result.get('ref')}`)"
+            else:
+                st_msg = f"⚠️ *Stockity:* falha — `{st_result.get('error', 'não confirmada')}`"
+        except Exception as exc:
+            st_msg = f"⚠️ *Stockity:* falha — `{exc}`"
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=st_msg, parse_mode='Markdown')
+        except Exception:
+            pass
+
 
 def _bitget_mode_label() -> str:
     """Texto amigável do modo de execução BitGet."""
@@ -4594,7 +4866,6 @@ async def bitget_limits_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def scan_auto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Liga/desliga o scanner automático de externos. Uso: /scan_auto on | off"""
     global _auto_scan_active
     arg = (context.args[0].lower() if context.args else '').strip()
     if arg in ('on', 'ativar', 'ligar', '1'):
@@ -4615,8 +4886,154 @@ async def scan_auto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+def _get_atlas_cryptoidx_signal():
+    """Busca candles Crypto IDX na Stockity e roda a estratégia de rejeição.
+
+    Retorna (signal, error_message). Uma exceção de rede/login vira uma
+    mensagem de erro amigável em vez de derrubar o comando/job.
+    """
+    try:
+        from src.core.stockity_market_data import StockityMarketData
+        from src.core.atlas_crypto_idx_strategy import analyze_rejection
+        from src.core.stockity_executor import StockitySettings as _StockitySettings
+    except Exception as exc:
+        return None, f"módulo indisponível: {exc}"
+
+    try:
+        settings = _StockitySettings.from_env()
+    except Exception as exc:
+        return None, f"configuração Stockity inválida: {exc}"
+
+    if not settings.email or not settings.password:
+        return None, "defina STOCKITY_EMAIL e STOCKITY_PASSWORD no .env"
+
+    try:
+        md = StockityMarketData(email=settings.email, password=settings.password, platform=settings.platform)
+        m1, m5 = md.get_m1_m5_candles(ric=settings.default_asset_ric, hours_back=3)
+        signal = analyze_rejection(m1, m5, asset="Crypto IDX")
+        return signal, None
+    except Exception as exc:
+        return None, f"falha ao buscar/analisar candles: {exc}"
+
+
+async def atlas_cryptoidx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Roda a análise ATLAS Crypto IDX (Rejeição) sob demanda. Uso: /atlas_cryptoidx"""
+    await _reply_text(update, "🔎 Analisando Crypto IDX (contexto M5 → região → rejeição M1)...")
+    loop = asyncio.get_event_loop()
+    signal, error = await loop.run_in_executor(None, _get_atlas_cryptoidx_signal)
+    if error or signal is None:
+        await _reply_text(update, f"❌ *ATLAS Crypto IDX:* {error}")
+        return
+    await _reply_text(update, signal.format_message())
+
+
+async def atlas_cryptoidx_auto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Liga/desliga o scanner automático ATLAS Crypto IDX (Rejeição).
+    Uso: /atlas_cryptoidx_auto on | off"""
+    global _atlas_cryptoidx_scan_active
+    arg = (context.args[0].lower() if context.args else '').strip()
+    if arg in ('on', 'ativar', 'ligar', '1'):
+        _atlas_cryptoidx_scan_active = True
+        await _reply_text(update,
+            "✅ *ATLAS Crypto IDX (Rejeição) — automático LIGADO*\n"
+            f"Vou analisar a cada {_ATLAS_CRYPTOIDX_SCAN_INTERVAL}s e avisar quando a qualidade "
+            f"for ≥ *{_atlas_cryptoidx_min_quality}* (ajuste com /atlas\\_cryptoidx\\_quality). "
+            "Sinais de qualidade A com ação ENTRAR são enviados na Stockity automaticamente "
+            "(se STOCKITY_EXECUTOR_ENABLED=true); B/C ficam apenas informativos.\n"
+            "Para desligar: /atlas\\_cryptoidx\\_auto off"
+        )
+    elif arg in ('off', 'desativar', 'desligar', '0'):
+        _atlas_cryptoidx_scan_active = False
+        await _reply_text(update, "⏹ *ATLAS Crypto IDX (Rejeição) — automático DESLIGADO.*")
+    else:
+        status = "LIGADO ✅" if _atlas_cryptoidx_scan_active else "DESLIGADO ⏹"
+        await _reply_text(update,
+            f"📡 ATLAS Crypto IDX (Rejeição) automático: *{status}*\n"
+            "Uso: `/atlas_cryptoidx_auto on` ou `/atlas_cryptoidx_auto off`"
+        )
+
+
+async def atlas_cryptoidx_quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Configura a qualidade mínima (A/B/C) que o auto-scan considera para
+    enviar alerta. Uso: /atlas_cryptoidx_quality [A|B|C]"""
+    global _atlas_cryptoidx_min_quality
+    arg = (context.args[0].upper() if context.args else '').strip()
+    if arg in _ATLAS_CRYPTOIDX_QUALITY_ORDER:
+        _atlas_cryptoidx_min_quality = arg
+        await _reply_text(
+            update,
+            f"✅ Qualidade mínima do ATLAS Crypto IDX ajustada para *{arg}*.\n"
+            "A = alta qualidade apenas | B = média ou alta | C = qualquer sinal (inclusive baixa qualidade).\n"
+            "Somente qualidade *A* + AÇÃO=ENTRAR executa automaticamente na Stockity; "
+            "B/C sempre ficam apenas informativos (alerta no chat)."
+        )
+    else:
+        await _reply_text(
+            update,
+            f"📊 Qualidade mínima atual: *{_atlas_cryptoidx_min_quality}*\n\n"
+            "Uso: `/atlas_cryptoidx_quality A` (só alta qualidade)\n"
+            "     `/atlas_cryptoidx_quality B` (média ou alta — padrão)\n"
+            "     `/atlas_cryptoidx_quality C` (qualquer sinal, inclusive baixa qualidade)\n\n"
+            "Isso controla quais sinais o /atlas\\_cryptoidx\\_auto te avisa. "
+            "A execução automática na Stockity continua exigindo sempre qualidade A + AÇÃO=ENTRAR."
+        )
+
+
+async def atlas_cryptoidx_auto_scan(context: ContextTypes.DEFAULT_TYPE):
+    """Job periódico: analisa Crypto IDX e, em qualidade A + ENTRAR, executa
+    na Stockity automaticamente. Notifica o chat quando a qualidade do sinal
+    atinge o mínimo configurado (padrão B) e a ação não é NAO_OPERAR."""
+    global _atlas_cryptoidx_last_signal_key
+
+    if not _atlas_cryptoidx_scan_active:
+        return
+
+    chat_id = monitor_target_chat_id or get_telegram_chat_id()
+    if not chat_id:
+        return
+
+    signal, error = await asyncio.get_event_loop().run_in_executor(None, _get_atlas_cryptoidx_signal)
+    if error or signal is None:
+        logger.debug(f"[ATLAS-CRYPTOIDX] erro: {error}")
+        return
+
+    if signal.action == "NAO_OPERAR":
+        return
+
+    min_rank = _ATLAS_CRYPTOIDX_QUALITY_ORDER.get(_atlas_cryptoidx_min_quality, 2)
+    signal_rank = _ATLAS_CRYPTOIDX_QUALITY_ORDER.get(signal.quality, 0)
+    if signal_rank < min_rank:
+        return
+
+    # Avoid re-alerting the exact same signal every poll cycle.
+    signal_key = (signal.context_m5, signal.region, signal.direction, signal.quality, signal.action)
+    if signal_key == _atlas_cryptoidx_last_signal_key:
+        return
+    _atlas_cryptoidx_last_signal_key = signal_key
+
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=signal.format_message(), parse_mode='Markdown')
+    except Exception:
+        pass
+
+    if signal.quality == "A" and signal.action == "ENTRAR" and signal.direction in ("CALL", "PUT"):
+        if STOCKITY_EXECUTOR_ENABLED and stockity_executor is not None:
+            try:
+                direction = "BUY" if signal.direction == "CALL" else "SELL"
+                st_result = await stockity_executor.place_order_async(symbol="CRYPTO IDX", direction=direction)
+                if st_result.get('ok') and st_result.get('executed'):
+                    st_msg = f"✅ *Stockity {st_result.get('mode')}:* ordem enviada (`ref {st_result.get('ref')}`)"
+                else:
+                    st_msg = f"⚠️ *Stockity:* falha — `{st_result.get('error', 'não confirmada')}`"
+            except Exception as exc:
+                st_msg = f"⚠️ *Stockity:* falha — `{exc}`"
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=st_msg, parse_mode='Markdown')
+            except Exception:
+                pass
+
+
 async def eco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostra calendário econômico do dia. Uso: /eco"""
     try:
         summary = economic_calendar.get_calendar_summary()
         await _reply_text(update, summary)
@@ -5783,6 +6200,8 @@ def main():
     application.add_handler(CommandHandler("monitor", monitor_command))
     application.add_handler(CommandHandler("monito", monitor_command))
     application.add_handler(CommandHandler("analise", analise_command))
+    application.add_handler(CommandHandler("lote", lote_command))
+    application.add_handler(CommandHandler("defesa", lote_command))
     application.add_handler(CommandHandler("btc", btc_command))
     application.add_handler(CommandHandler("bitcoin", btc_command))
     application.add_handler(CommandHandler("btcusdt", btc_command))
@@ -5801,6 +6220,9 @@ def main():
     application.add_handler(CommandHandler("sinal_externo", externo_command))
     application.add_handler(CommandHandler("listar_externos", listar_externos_command))
     application.add_handler(CommandHandler("scan_auto", scan_auto_command))
+    application.add_handler(CommandHandler("atlas_cryptoidx", atlas_cryptoidx_command))
+    application.add_handler(CommandHandler("atlas_cryptoidx_auto", atlas_cryptoidx_auto_command))
+    application.add_handler(CommandHandler("atlas_cryptoidx_quality", atlas_cryptoidx_quality_command))
     application.add_handler(CommandHandler("bitget_status", bitget_status_command))
     application.add_handler(CommandHandler("bitget_toggle", bitget_toggle_command))
     application.add_handler(CommandHandler("bitget_config", bitget_config_command))
@@ -5828,6 +6250,11 @@ def main():
         auto_scan_externos,
         interval=SCAN_POLL_SECONDS,
         first=min(60, SCAN_POLL_SECONDS)
+    )
+    job_queue.run_repeating(
+        atlas_cryptoidx_auto_scan,
+        interval=_ATLAS_CRYPTOIDX_SCAN_INTERVAL,
+        first=min(60, _ATLAS_CRYPTOIDX_SCAN_INTERVAL)
     )
     job_queue.run_repeating(
         alert_upcoming_events,

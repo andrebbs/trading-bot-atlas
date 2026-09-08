@@ -9,7 +9,7 @@ Agent instructions for this repository.
 - Keep this project separate from `/home/abbs/forex-bot` (different codebase and ops flow).
 
 ## First Steps For Any Task
-1. Read `README.md` and `docs/README.md` for feature overview.
+1. Read `README.md` and `../trading-bot-version-sem-novadexy-docs/README.md` for feature overview.
 2. Check market/profile startup scripts before changing runtime behavior:
    - `run_bot_main.sh`
    - `run_bot_abbs_forex.sh`
@@ -59,12 +59,12 @@ Agent instructions for this repository.
 - Runtime configs/artifacts: `logs/trade_config.json`, `logs/paper_trades.json`, `logs/eco_events.json`
 
 ## Documentation Links (Source Of Truth)
-- Setup and install: [INSTALL.md](INSTALL.md), [QUICKSTART.md](QUICKSTART.md)
+- Setup and install: [INSTALL.md](../trading-bot-version-sem-novadexy-docs/INSTALL.md), [QUICKSTART.md](../trading-bot-version-sem-novadexy-docs/QUICKSTART.md)
 - Main overview: [README.md](README.md)
-- Docs index: [docs/README.md](docs/README.md)
-- Telegram behavior and commands: [docs/TELEGRAM_BOT.md](docs/TELEGRAM_BOT.md)
-- MT5 integration notes: [docs/MT5_SETUP.md](docs/MT5_SETUP.md)
-- Current roadmap/checklist: [docs/PROJECT_CHECKLIST.md](docs/PROJECT_CHECKLIST.md)
+- Docs index: [README.md](../trading-bot-version-sem-novadexy-docs/README.md)
+- Telegram behavior and commands: [TELEGRAM_BOT.md](../trading-bot-version-sem-novadexy-docs/TELEGRAM_BOT.md)
+- MT5 integration notes: [MT5_SETUP.md](../trading-bot-version-sem-novadexy-docs/MT5_SETUP.md)
+- Current roadmap/checklist: [PROJECT_CHECKLIST.md](../trading-bot-version-sem-novadexy-docs/PROJECT_CHECKLIST.md)
 
 ## Editing Guidance
 - Prefer targeted fixes over broad refactors.

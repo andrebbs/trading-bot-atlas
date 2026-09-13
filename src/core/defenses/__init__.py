@@ -1,1 +1,1 @@
-# Pacote de Defesas Modulares da Lógica do Preço (Aulas 1 a 4)
+# Módulo de Defesas 1 a 4 da Lógica do Preço

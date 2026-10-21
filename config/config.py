@@ -4,7 +4,10 @@ Configurações do Bot de Trading
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+# override=True: o .env sempre vence valores já exportados no shell. Evita
+# que um `export TELEGRAM_BOT_TOKEN=...` antigo esquecido no terminal
+# "grude" e sobreponha silenciosamente o token/segredo atual do .env.
+load_dotenv(override=True)
 
 # Configurações da Exchange
 EXCHANGE = os.getenv('EXCHANGE', 'binance')  # binance, bybit, etc

@@ -1,13 +1,49 @@
 #!/usr/bin/env bash
-# Script de execução principal do Bot Lógica do Preço M1 / OTC
-set -e
+set -euo pipefail
 
-echo "=================================================="
-echo "  ATLAS — Motor da Lógica do Preço (M1 / OTC)"
-echo "Ouve o feed M1, avalia os 4 quadrantes da Lógica do Preço e executa Paper Trading."
-echo "=================================================="
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
-export PYTHONPATH="$(pwd):$(pwd)/src"
+export BOT_PROFILE="${BOT_PROFILE:-main}"
+export BOT_INSTANCE_NAME="${BOT_INSTANCE_NAME:-main}"
 
-# Executa o orquestrador principal em modo demo / paper trading
-python3 src/main.py --symbols EURUSD GBPUSD USDJPY --min-defenses 3 --demo
+# Opcional: força mercado principal (crypto/forex)
+export MARKET_TYPE="${MARKET_TYPE:-crypto_binary}"
+# Limite de sinais por ciclo de monitoramento (ajuste aqui se quiser mais/menos sinais).
+export MONITOR_MAX_SIGNALS="${MONITOR_MAX_SIGNALS:-8}"
+# Desligado por padrão: o ATLAS (multi-técnica) e a Lógica do Preço (Defesas)
+# não devem rodar juntos (geram alertas/filtros conflitantes para o mesmo
+# ativo). Use /modo no Telegram para escolher qual engine fica ativo, ou
+# defina MONITOR_AUTO_START=1 explicitamente para voltar ao ATLAS no boot.
+export MONITOR_AUTO_START="${MONITOR_AUTO_START:-0}"
+export MONITOR_CONTINUOUS_MODE="${MONITOR_CONTINUOUS_MODE:-1}"
+
+choose_python() {
+  local candidates=(
+    "$SCRIPT_DIR/.venv/bin/python3"
+    "$SCRIPT_DIR/.venv_trading/bin/python3"
+    "$SCRIPT_DIR/.venv_run/bin/python3"
+    "/usr/bin/python3"
+    "python3"
+  )
+
+  local py
+  for py in "${candidates[@]}"; do
+    if command -v "$py" >/dev/null 2>&1; then
+      if "$py" -c "import pandas, telegram" >/dev/null 2>&1; then
+        echo "$py"
+        return 0
+      fi
+    fi
+  done
+
+  return 1
+}
+
+if ! PY_BIN="$(choose_python)"; then
+  echo "Erro: nao encontrei Python com dependencias (pandas + python-telegram-bot)." >&2
+  echo "Rode: python3 -m pip install --user -r requirements.txt" >&2
+  exit 1
+fi
+
+exec "$PY_BIN" src/bots/telegram_bot.py

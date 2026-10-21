@@ -20,9 +20,9 @@ import atexit
 import fcntl
 import numpy as np
 import pandas as pd
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.helpers import escape_markdown
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -37,6 +37,8 @@ from src.core.lot_defense import (
     BreakSituation,
     Candle as LotCandle,
     DefenseSituation,
+    DefenseType,
+    LotDefenseAnalyzer,
     LotReading,
     LotSide,
     build_lot_framework,
@@ -95,6 +97,42 @@ _ATLAS_CRYPTOIDX_QUALITY_ORDER = {"A": 3, "B": 2, "C": 1}
 _atlas_cryptoidx_min_quality = os.getenv('ATLAS_CRYPTOIDX_MIN_QUALITY', 'B').strip().upper()
 if _atlas_cryptoidx_min_quality not in _ATLAS_CRYPTOIDX_QUALITY_ORDER:
     _atlas_cryptoidx_min_quality = 'B'
+
+# Lógica do Preço — Defesas (altcoins): varredura automática que aplica o
+# motor de 5 Defesas (Vela do Lote, Nova Posição, Vela de Comando, Primeiro
+# Registro, Taxa Dividida) às cryptos monitoradas, EXCETO BTC e ETH. Só emite
+# sinal de entrada quando há >= PRICE_LOGIC_ALT_MIN_DEFENSES defesas
+# confluentes no mesmo nível (regra de ouro do estudo em
+# docs/estudo_protecao_ordens.md). Desligado por padrão.
+PRICE_LOGIC_ALT_SCAN_INTERVAL = int(os.getenv('PRICE_LOGIC_ALT_SCAN_INTERVAL_SECONDS', '60'))
+PRICE_LOGIC_ALT_MIN_DEFENSES = int(os.getenv('PRICE_LOGIC_ALT_MIN_DEFENSES', '3'))
+PRICE_LOGIC_ALT_TIMEFRAME = os.getenv('PRICE_LOGIC_ALT_TIMEFRAME', '1m').strip().lower() or '1m'
+_price_logic_alt_exclude_raw = os.getenv('PRICE_LOGIC_ALT_EXCLUDE_SYMBOLS', 'BTC/USDT,ETH/USDT')
+PRICE_LOGIC_ALT_EXCLUDE_SYMBOLS = {
+    s.strip().upper() for s in _price_logic_alt_exclude_raw.split(',') if s.strip()
+}
+_price_logic_alt_scan_active = os.getenv('PRICE_LOGIC_ALT_AUTO_START', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
+_price_logic_alt_last_signal_keys: dict[str, tuple] = {}
+
+# Qualidade mínima da reação exigida para emitir alerta (evita sinais fracos
+# tipo WICK_WITHOUT_LOCK, que são "defesa mais fraca, exige confirmação" e
+# reverteram com frequência nos primeiros testes em produção).
+_PRICE_LOGIC_REACTION_ORDER = {
+    DefenseSituation.WICK_WITHOUT_LOCK.value: 1,
+    DefenseSituation.LOCKED_AT_OPEN.value: 2,
+    DefenseSituation.STRONG_REJECTION.value: 3,
+}
+PRICE_LOGIC_ALT_MIN_REACTION = os.getenv('PRICE_LOGIC_ALT_MIN_REACTION', 'LOCKED_AT_OPEN').strip().upper()
+if PRICE_LOGIC_ALT_MIN_REACTION not in _PRICE_LOGIC_REACTION_ORDER:
+    PRICE_LOGIC_ALT_MIN_REACTION = 'LOCKED_AT_OPEN'
+
+_PRICE_LOGIC_DEFENSE_LABELS = {
+    DefenseType.VELA_DO_LOTE.value: "1ª Vela do Lote (abertura + pavio da abertura)",
+    DefenseType.NOVA_POSICAO.value: "2ª Nova Posição (abertura + pavio da abertura)",
+    DefenseType.VELA_DE_COMANDO.value: "3ª Vela de Comando (abertura)",
+    DefenseType.PRIMEIRO_REGISTRO.value: "4ª 1º Registro (ponta do pavio)",
+    DefenseType.TAXA_DIVIDIDA.value: "5ª Taxa Dividida (abertura + pavio da abertura)",
+}
 
 def _now_str() -> str:
     from datetime import datetime
@@ -2182,22 +2220,13 @@ def get_telegram_bot_token():
     return get_profile_env('TELEGRAM_BOT_TOKEN') or getattr(config, 'TELEGRAM_BOT_TOKEN', None)
 
 
-def bootstrap_auto_monitoring() -> tuple[bool, str | None]:
-    """Ativa o monitoramento no boot quando solicitado por ambiente."""
+def _activate_atlas_monitor(chat_id) -> None:
+    """Liga o monitor ATLAS (multi-técnica, job `monitor_market`) para o chat
+    informado, resetando o estado da sessão. Usado no boot e pelo /modo."""
     global monitoring_active, monitor_end_time, monitor_signals_sent, current_rotation_index
     global pending_signal_evaluations, pending_martingale_decisions, last_pre_alert_key, last_direction_alert_at
     global monitor_target_chat_id, monitor_started_at, monitor_last_alert_at, monitor_last_heartbeat_at
     global monitor_session_results, last_fresh_alert_at, monitor_duration_minutes
-
-    if not MONITOR_AUTO_START:
-        return False, None
-
-    chat_id = get_telegram_chat_id()
-    if not chat_id:
-        return False, 'TELEGRAM_CHAT_ID ausente'
-
-    if not monitored_symbols:
-        return False, 'nenhum ativo configurado para monitoramento'
 
     monitor_duration_minutes = MONITOR_DURATION_MINUTES
     monitoring_active = True
@@ -2215,6 +2244,33 @@ def bootstrap_auto_monitoring() -> tuple[bool, str | None]:
     last_pre_alert_key.clear()
     last_direction_alert_at.clear()
     weekend_reentry_tracker.clear()
+
+
+def _deactivate_atlas_monitor() -> None:
+    """Desliga o monitor ATLAS (job `monitor_market`). Usado pelo /modo."""
+    global monitoring_active, monitor_end_time, monitor_target_chat_id
+    global monitor_started_at, monitor_last_alert_at, monitor_last_heartbeat_at
+    monitoring_active = False
+    monitor_end_time = None
+    monitor_target_chat_id = None
+    monitor_started_at = None
+    monitor_last_alert_at = None
+    monitor_last_heartbeat_at = None
+
+
+def bootstrap_auto_monitoring() -> tuple[bool, str | None]:
+    """Ativa o monitoramento no boot quando solicitado por ambiente."""
+    if not MONITOR_AUTO_START:
+        return False, None
+
+    chat_id = get_telegram_chat_id()
+    if not chat_id:
+        return False, 'TELEGRAM_CHAT_ID ausente'
+
+    if not monitored_symbols:
+        return False, 'nenhum ativo configurado para monitoramento'
+
+    _activate_atlas_monitor(chat_id)
     return True, None
 
 
@@ -2955,6 +3011,307 @@ async def lote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Erro ao ler lotes de `{current_symbol}`: {exc}",
             parse_mode='Markdown',
         )
+
+
+def _resolve_price_logic_altcoin_symbols() -> list[str]:
+    """Lista de cryptos monitoradas, excluindo BTC/ETH (PRICE_LOGIC_ALT_EXCLUDE_SYMBOLS)."""
+    return [
+        s for s in crypto_monitored_symbols
+        if s.upper() not in PRICE_LOGIC_ALT_EXCLUDE_SYMBOLS
+    ]
+
+
+def _collect_defense_timestamps(analyzer, signal, candles) -> dict[str, "datetime"]:
+    """Mapeia cada tipo de defesa do sinal para o horário (timestamp) da vela
+    de referência mais próxima, permitindo localizar a defesa no gráfico real."""
+    timestamps: dict[str, object] = {}
+    for level in analyzer.active_levels:
+        if level.side != signal.action:
+            continue
+        if abs(level.price_level - signal.price) > analyzer.tolerance:
+            continue
+        key = level.defense_type.value
+        if key not in timestamps and 0 <= level.reference_index < len(candles):
+            timestamps[key] = candles[level.reference_index].timestamp
+    return timestamps
+
+
+def _scan_price_logic_altcoin_signals():
+    """Busca candles M1 das altcoins monitoradas (sem BTC/ETH) e aplica o
+    motor de 5 Defesas da Lógica do Preço. Retorna (sinais, erro).
+
+    `sinais` é uma lista de tuplas (symbol, LotSignal, timestamps_por_defesa)
+    apenas para os ativos em que houve defesas suficientes convergindo no
+    mesmo nível de preço E reação >= PRICE_LOGIC_ALT_MIN_REACTION.
+    Função bloqueante — deve ser chamada via run_in_executor.
+    """
+    symbols = _resolve_price_logic_altcoin_symbols()
+    if not symbols:
+        return [], "nenhuma altcoin monitorada além de BTC/ETH"
+
+    try:
+        exchange = ExchangeConnector(testnet=config.TESTNET)
+    except Exception as exc:
+        return [], f"falha ao conectar na exchange: {exc}"
+
+    min_reaction_rank = _PRICE_LOGIC_REACTION_ORDER.get(PRICE_LOGIC_ALT_MIN_REACTION, 2)
+
+    found: list[tuple[str, object, dict]] = []
+    for symbol in symbols:
+        try:
+            df = exchange.fetch_ohlcv(symbol, PRICE_LOGIC_ALT_TIMEFRAME, limit=150)
+            if df is None or len(df) < 10:
+                continue
+            candles = _dataframe_to_lot_candles(df)
+            lots = detect_lots(candles[:-1])
+            analyzer = LotDefenseAnalyzer(symbol=symbol, min_defenses=PRICE_LOGIC_ALT_MIN_DEFENSES)
+            signal = analyzer.evaluate_last_candle_for_signal(candles, lots)
+            if signal is None:
+                continue
+            if _PRICE_LOGIC_REACTION_ORDER.get(signal.reaction.value, 0) < min_reaction_rank:
+                continue
+            timestamps = _collect_defense_timestamps(analyzer, signal, candles)
+            found.append((symbol, signal, timestamps))
+        except Exception as exc:
+            logger.debug("[PRICE-LOGIC-ALT] falha ao analisar %s: %s", symbol, exc)
+            continue
+
+    return found, None
+
+
+def _format_price_logic_altcoin_message(symbol: str, signal, timestamps: dict | None = None) -> str:
+    """Monta o alerta de entrada citando as defesas/confluências encontradas
+    (metodologia do card Price Logic Flow: Defesas -> Confluências -> Filtros).
+    Inclui o horário de cada defesa para o usuário localizar a vela exata no
+    gráfico real (fonte: Binance Spot, não a cotação sintética da corretora
+    OTC usada para operar)."""
+    timestamps = timestamps or {}
+    action_label = "CALL (COMPRA) 🟢" if signal.action is LotSide.BUY else "PUT (VENDA) 🔴"
+    defense_lines = []
+    for d in signal.defenses:
+        label = _PRICE_LOGIC_DEFENSE_LABELS.get(d, d)
+        ts = timestamps.get(d)
+        ts_str = f" — vela `{ts:%H:%M}` UTC" if ts is not None else ""
+        defense_lines.append(f"  ✅ {label}{ts_str}")
+    lines = [
+        "🎯 *SINAL LÓGICA DO PREÇO — Altcoins (M1)*",
+        f"Ativo: `{symbol}` (Binance Spot) | Direção: *{action_label}*",
+        f"Taxa de defesa (nível testado): `{_format_lot_price(signal.price)}`",
+        "",
+        f"🛡️ *Defesas válidas encontradas ({signal.defense_count}/5"
+        f", mínimo exigido {PRICE_LOGIC_ALT_MIN_DEFENSES}):*",
+        "\n".join(defense_lines),
+    ]
+    if signal.confluences:
+        lines += ["", "🔗 *Confluência(s) positiva(s):*"]
+        lines += [f"  • {c}" for c in sorted(set(signal.confluences))]
+    if signal.filters_passed:
+        lines += ["", "🧪 *Filtro(s) de entrada aprovado(s):*"]
+        lines += [f"  • {f}" for f in signal.filters_passed]
+    lines += [
+        "",
+        f"⚡ Reação: `{signal.reaction.value}`",
+        "⏳ *Expiração sugerida: 1 Minuto*",
+        "",
+        "⚠️ *Fonte dos candles: Binance Spot (XRP/USDT etc.)*. Se você opera em "
+        "outra corretora (ex. Adax, binárias/OTC), a cotação sintética dela pode "
+        "ter velas levemente diferentes — use os horários acima para localizar a "
+        "defesa no gráfico da Binance/TradingView antes de confiar 100% no "
+        "gráfico da corretora.",
+        "",
+        "📋 Metodologia: card *Price Logic Flow* — 1) Defesas → 2) Confluências → "
+        "3) Filtros negativos → 4) Gráfico oculto. Este alerta cobre as etapas 1 e 2; "
+        "confirme o contexto (filtros negativos) antes de operar.",
+        "",
+        "⚠️ Sinal automatizado com base em estudo próprio, sem garantia de resultado. "
+        "Use gestão de risco e confirme o contexto de mercado.",
+    ]
+    return "\n".join(lines)
+
+
+async def price_logic_altcoin_auto_scan(context: ContextTypes.DEFAULT_TYPE):
+    """Job periódico: varre altcoins monitoradas (exceto BTC/ETH) com o motor
+    de 5 Defesas e envia alerta de entrada quando houver confluência mínima."""
+    if not _price_logic_alt_scan_active:
+        return
+
+    chat_id = monitor_target_chat_id or get_telegram_chat_id()
+    if not chat_id:
+        return
+
+    signals, error = await asyncio.get_event_loop().run_in_executor(
+        None, _scan_price_logic_altcoin_signals
+    )
+    if error:
+        logger.debug("[PRICE-LOGIC-ALT] %s", error)
+        return
+
+    for symbol, signal, timestamps in signals:
+        signal_key = (signal.action.value, str(signal.price), signal.timestamp.isoformat())
+        if _price_logic_alt_last_signal_keys.get(symbol) == signal_key:
+            continue
+        _price_logic_alt_last_signal_keys[symbol] = signal_key
+
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=_format_price_logic_altcoin_message(symbol, signal, timestamps),
+                parse_mode='Markdown',
+            )
+        except Exception:
+            pass
+
+
+async def price_logic_altcoin_auto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Liga/desliga a varredura automática de Defesas (altcoins, exceto BTC/ETH).
+    Uso: /logica_altcoins_auto on | off"""
+    global _price_logic_alt_scan_active
+    arg = (context.args[0].lower() if context.args else '').strip()
+    if arg in ('on', 'ativar', 'ligar', '1'):
+        _price_logic_alt_scan_active = True
+        symbols = _resolve_price_logic_altcoin_symbols()
+        await _reply_text(
+            update,
+            "✅ *Lógica do Preço — Defesas (Altcoins) automático LIGADO*\n"
+            f"Monitorando: {', '.join(symbols) if symbols else '(nenhuma altcoin configurada)'}\n"
+            f"Verificação a cada {PRICE_LOGIC_ALT_SCAN_INTERVAL}s, timeframe "
+            f"{PRICE_LOGIC_ALT_TIMEFRAME}, mínimo de {PRICE_LOGIC_ALT_MIN_DEFENSES} defesas "
+            f"confluentes com reação ≥ {PRICE_LOGIC_ALT_MIN_REACTION} (BTC e ETH excluídos deste scan).\n"
+            "Para desligar: /logica_altcoins_auto off",
+            parse_mode='Markdown',
+        )
+    elif arg in ('off', 'desativar', 'desligar', '0'):
+        _price_logic_alt_scan_active = False
+        await _reply_text(
+            update,
+            "⏹ *Lógica do Preço — Defesas (Altcoins) automático DESLIGADO.*",
+            parse_mode='Markdown',
+        )
+    else:
+        status = "LIGADO ✅" if _price_logic_alt_scan_active else "DESLIGADO ⏹"
+        await _reply_text(
+            update,
+            f"📡 Lógica do Preço — Defesas (Altcoins) automático: *{status}*\n"
+            "Uso: `/logica_altcoins_auto on` ou `/logica_altcoins_auto off`",
+            parse_mode='Markdown',
+        )
+
+
+async def logica_altcoins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Roda a varredura de Defesas (altcoins, exceto BTC/ETH) sob demanda.
+    Uso: /logica_altcoins"""
+    symbols = _resolve_price_logic_altcoin_symbols()
+    if not symbols:
+        await _reply_text(update, "⚠️ Nenhuma altcoin monitorada além de BTC/ETH no momento.")
+        return
+
+    await _reply_text(update, f"🔎 Analisando defesas em {', '.join(symbols)} ({PRICE_LOGIC_ALT_TIMEFRAME})...")
+    signals, error = await asyncio.get_event_loop().run_in_executor(
+        None, _scan_price_logic_altcoin_signals
+    )
+    if error:
+        await _reply_text(update, f"❌ *Lógica do Preço (Altcoins):* {error}", parse_mode='Markdown')
+        return
+    if not signals:
+        await _reply_text(
+            update,
+            f"ℹ️ Nenhuma das altcoins monitoradas tem ≥{PRICE_LOGIC_ALT_MIN_DEFENSES} defesas "
+            f"confluentes com reação ≥ {PRICE_LOGIC_ALT_MIN_REACTION} no momento."
+        )
+        return
+    for symbol, signal, timestamps in signals:
+        await _reply_text(
+            update,
+            _format_price_logic_altcoin_message(symbol, signal, timestamps),
+            parse_mode='Markdown',
+        )
+
+
+def _get_active_mode_label() -> str:
+    """Resume qual(is) engine(s) de sinal estão ativas no momento."""
+    atlas_on = monitoring_active
+    logica_on = _price_logic_alt_scan_active
+    if atlas_on and logica_on:
+        return "⚠️ ATLAS + Lógica do Preço (ambos ativos — pode gerar sinais conflitantes)"
+    if atlas_on:
+        return "🅰️ ATLAS (multi-técnica)"
+    if logica_on:
+        return "🧩 Lógica do Preço (Defesas)"
+    return "⏹ Nenhum engine ativo"
+
+
+def _build_mode_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🅰️ ATLAS (multi-técnica)", callback_data="modo_atlas")],
+        [InlineKeyboardButton("🧩 Lógica do Preço (Defesas)", callback_data="modo_logica")],
+        [InlineKeyboardButton("⏹ Desligar tudo", callback_data="modo_off")],
+    ])
+
+
+async def _apply_trading_mode(mode: str, chat_id) -> str:
+    """Liga o engine escolhido e desliga o outro, para não rodar os dois ao
+    mesmo tempo (evita sinais/alertas conflitantes para o mesmo ativo).
+    Retorna o texto de confirmação."""
+    global _price_logic_alt_scan_active
+
+    if mode == 'atlas':
+        _price_logic_alt_scan_active = False
+        _activate_atlas_monitor(chat_id)
+        return (
+            "✅ *Modo: ATLAS (multi-técnica)*\n"
+            "Lógica do Preço (Defesas) foi desligada para evitar sinais conflitantes.\n"
+            "Use /monitor para detalhes do ATLAS."
+        )
+    if mode == 'logica':
+        _deactivate_atlas_monitor()
+        _price_logic_alt_scan_active = True
+        symbols = ', '.join(_resolve_price_logic_altcoin_symbols())
+        return (
+            "✅ *Modo: Lógica do Preço (Defesas)*\n"
+            f"Monitorando: {symbols or '(nenhuma altcoin configurada)'}\n"
+            "ATLAS (multi-técnica) foi desligado para evitar sinais conflitantes.\n"
+            "Use /logica_altcoins_auto para detalhes."
+        )
+    # 'off'
+    _deactivate_atlas_monitor()
+    _price_logic_alt_scan_active = False
+    return "⏹ *Todos os engines de sinal foram desligados.* Use /modo para reativar."
+
+
+async def modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menu para escolher qual engine de sinal fica ativo: ATLAS (multi-técnica)
+    ou Lógica do Preço (Defesas) — os dois nunca rodam juntos, para não gerar
+    alertas/filtros conflitantes para o mesmo ativo.
+    Uso: /modo [atlas|logica|off] (sem argumento mostra o menu)."""
+    arg = (context.args[0].lower() if context.args else '').strip()
+    chat_id = update.effective_chat.id if update.effective_chat else get_telegram_chat_id()
+
+    if arg in ('atlas', 'logica', 'logica_preco', 'defesas', 'off', 'desligar'):
+        mode = 'off' if arg in ('off', 'desligar') else ('logica' if arg.startswith('logica') or arg == 'defesas' else 'atlas')
+        text = await _apply_trading_mode(mode, chat_id)
+        await _reply_text(update, text, parse_mode='Markdown')
+        return
+
+    await _reply_text(
+        update,
+        f"🎛️ *Modo atual:* {_get_active_mode_label()}\n\n"
+        "Escolha qual engine de sinal deve ficar ativo (só um por vez, para "
+        "não misturar alertas/filtros do ATLAS com os da Lógica do Preço):",
+        parse_mode='Markdown',
+        reply_markup=_build_mode_menu_keyboard(),
+    )
+
+
+async def modo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Trata o clique nos botões do /modo."""
+    query = update.callback_query
+    await query.answer()
+    mode = {'modo_atlas': 'atlas', 'modo_logica': 'logica', 'modo_off': 'off'}.get(query.data)
+    if mode is None:
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else get_telegram_chat_id()
+    text = await _apply_trading_mode(mode, chat_id)
+    await query.edit_message_text(text, parse_mode='Markdown')
 
 
 async def btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5075,6 +5432,11 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = monitor_target_chat_id or get_telegram_chat_id()
     now = datetime.now()
+    # Chamadas de rede (fetch_ohlcv/get_ticker/ExchangeConnector) são
+    # bloqueantes; rodam em executor para não travar o event loop (que
+    # também atende getUpdates/comandos do Telegram) durante os ciclos
+    # do monitor.
+    loop = asyncio.get_event_loop()
 
     # Desativa monitoramento automaticamente ao fim da janela configurada.
     if monitor_end_time and now >= monitor_end_time:
@@ -5145,17 +5507,17 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
             and MARTINGALE_REENTRY_MIN_SECONDS <= decision_seconds <= MARTINGALE_REENTRY_MAX_SECONDS
         ):
             try:
-                exchange = ExchangeConnector(testnet=config.TESTNET)
+                exchange = await loop.run_in_executor(None, lambda: ExchangeConnector(testnet=config.TESTNET))
                 eval_symbol = pending.get('market_symbol', pending['symbol'])
                 tf = pending.get('timeframe', config.TIMEFRAME)
-                df_live = exchange.fetch_ohlcv(eval_symbol, tf, limit=200)
+                df_live = await loop.run_in_executor(None, exchange.fetch_ohlcv, eval_symbol, tf, 200)
                 if df_live is not None and len(df_live) >= 40:
                     tech_live = TechnicalIndicators(df_live.iloc[:-1].copy())
                     closed_live = tech_live.calculate_all_indicators(MONITOR_INDICATORS_CONFIG)
                     signal_data = TradingAnalyzer(closed_live).get_current_signal()
                     weekend_setup = evaluate_weekend_binary_setup(closed_live, tf, signal_data)
                     current_price = None
-                    ticker = exchange.get_ticker(eval_symbol)
+                    ticker = await loop.run_in_executor(None, exchange.get_ticker, eval_symbol)
                     if ticker and ticker.get('last') is not None:
                         current_price = float(ticker['last'])
                     else:
@@ -5393,12 +5755,17 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
     
     # Apenas 1 alerta por ciclo para evitar sinais muito proximos.
     alert_to_send = None
-    
+
     # Reutiliza a mesma conexão por ciclo para reduzir latência e evitar ciclos perdidos.
-    exchange = ExchangeConnector(testnet=config.TESTNET)
+    exchange = await loop.run_in_executor(None, lambda: ExchangeConnector(testnet=config.TESTNET))
 
     # Monitora ativos selecionados do ciclo
     for symbol in symbols_to_check:
+        # Cede o event loop entre ativos: cada iteração faz chamadas de rede
+        # bloqueantes (fetch_ohlcv); sem este yield, o bot não processa
+        # comandos/getUpdates do Telegram até o ciclo inteiro terminar,
+        # dando sensação de "chat travado" durante o scan.
+        await asyncio.sleep(0)
         try:
             market_symbol, market_note = resolve_market_symbol(symbol)
             if not market_symbol:
@@ -5450,11 +5817,12 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
             m5_confirmation_context = None
 
             for timeframe in timeframes_to_check:
+                await asyncio.sleep(0)
                 pre_alert_max_seconds, pre_alert_min_seconds = get_pre_alert_window_seconds(timeframe)
                 min_probability, min_edge, min_consensus = get_quality_gates(timeframe)
                 min_setup_score = get_setup_min_score(timeframe)
 
-                df = exchange.fetch_ohlcv(market_symbol, timeframe, limit=300)
+                df = await loop.run_in_executor(None, exchange.fetch_ohlcv, market_symbol, timeframe, 300)
                 if df is None or len(df) < 30:
                     continue
 
@@ -5472,7 +5840,7 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                 analyzer_signal = _normalize_signal_to_int(signal_data.get('signal'))
 
                 if ticker is None:
-                    ticker = exchange.get_ticker(market_symbol)
+                    ticker = await loop.run_in_executor(None, exchange.get_ticker, market_symbol)
                 current_price = ticker['last'] if ticker else closed_df.iloc[-1]['close']
 
                 if weekend_setup is not None:
@@ -6199,6 +6567,9 @@ def main():
     application.add_handler(CommandHandler("ativo", ativo_command))
     application.add_handler(CommandHandler("monitor", monitor_command))
     application.add_handler(CommandHandler("monito", monitor_command))
+    application.add_handler(CommandHandler("modo", modo_command))
+    application.add_handler(CommandHandler("mode", modo_command))
+    application.add_handler(CallbackQueryHandler(modo_callback, pattern="^modo_"))
     application.add_handler(CommandHandler("analise", analise_command))
     application.add_handler(CommandHandler("lote", lote_command))
     application.add_handler(CommandHandler("defesa", lote_command))
@@ -6223,6 +6594,8 @@ def main():
     application.add_handler(CommandHandler("atlas_cryptoidx", atlas_cryptoidx_command))
     application.add_handler(CommandHandler("atlas_cryptoidx_auto", atlas_cryptoidx_auto_command))
     application.add_handler(CommandHandler("atlas_cryptoidx_quality", atlas_cryptoidx_quality_command))
+    application.add_handler(CommandHandler("logica_altcoins", logica_altcoins_command))
+    application.add_handler(CommandHandler("logica_altcoins_auto", price_logic_altcoin_auto_command))
     application.add_handler(CommandHandler("bitget_status", bitget_status_command))
     application.add_handler(CommandHandler("bitget_toggle", bitget_toggle_command))
     application.add_handler(CommandHandler("bitget_config", bitget_config_command))
@@ -6257,13 +6630,28 @@ def main():
         first=min(60, _ATLAS_CRYPTOIDX_SCAN_INTERVAL)
     )
     job_queue.run_repeating(
+        price_logic_altcoin_auto_scan,
+        interval=PRICE_LOGIC_ALT_SCAN_INTERVAL,
+        first=min(60, PRICE_LOGIC_ALT_SCAN_INTERVAL)
+    )
+    job_queue.run_repeating(
         alert_upcoming_events,
         interval=600,   # a cada 10 minutos
         first=120       # primeira verificação 2 min após o boot
     )
 
     auto_started, auto_reason = bootstrap_auto_monitoring()
-    if auto_started:
+    if auto_started and _price_logic_alt_scan_active:
+        # Nunca roda os dois engines juntos (alertas/filtros conflitantes
+        # para o mesmo ativo); Lógica do Preço tem prioridade no boot.
+        # Use /modo no Telegram para trocar.
+        _deactivate_atlas_monitor()
+        auto_started = False
+        print(
+            "⚠️ ATLAS e Lógica do Preço estavam ambos configurados para autoativar; "
+            "mantive só a Lógica do Preço (Defesas). Use /modo para trocar."
+        )
+    elif auto_started:
         job_queue.run_once(notify_auto_monitor_started, when=1)
         print(f"▶️ Monitoramento autoativado: {', '.join(monitored_symbols)}")
 
@@ -6273,6 +6661,12 @@ def main():
         print("▶️ Scan automático Bitget autoativado (SCAN_AUTO_START=true)")
     elif MONITOR_AUTO_START and auto_reason:
         print(f"⚠️ Auto-monitoramento não iniciado: {auto_reason}")
+
+    if _price_logic_alt_scan_active:
+        print(
+            "▶️ Lógica do Preço — Defesas (Altcoins) autoativado "
+            f"(PRICE_LOGIC_ALT_AUTO_START=true): {', '.join(_resolve_price_logic_altcoin_symbols())}"
+        )
     
     print(f"✅ Bot iniciado com sucesso! (perfil: {BOT_PROFILE})")
     print("📱 Procure seu bot no Telegram e envie /start")
